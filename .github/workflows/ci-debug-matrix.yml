@@ -1,0 +1,116 @@
+name: CI (Debug - matrix)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**'
+      - '!**.md'
+      - '!.github/**'
+      - '.github/scripts/**'
+      - '.github/workflows/build_push.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  CI_CHUNK_SIZE: 65
+  IS_PR_CHECK: false
+
+jobs:
+  prepare:
+    name: Prepare job
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.generate-matrices.outputs.matrix }}
+      delete: ${{ steps.generate-matrices.outputs.delete }}
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@017a9effdb900e5b5b2fddfb590a105619dca3c3
+        with:
+          cache-read-only: true
+
+      - name: Get last successful CI commit
+        uses: nrwl/nx-set-shas@826660b82addbef3abff5fa871492ebad618c9e1
+        with:
+          fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+
+      - id: generate-matrices
+        name: Create output matrices
+        run: |
+          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release
+
+  build:
+    name: Build debug extensions (${{ matrix.chunk.number }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ toJson(fromJson(needs.prepare.outputs.matrix).chunk) != '[]' }}
+    strategy:
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@017a9effdb900e5b5b2fddfb590a105619dca3c3
+        with:
+          cache-read-only: ${{ matrix.chunk.number > 1 }}
+
+      - name: Build debug APKs for chunk (${{ matrix.chunk.number }})
+        env:
+          MODULES: ${{ join(matrix.chunk.modules, ' ') }}
+        run: |
+          echo "Modules/tasks (original): $MODULES"
+          # convert any assembleRelease tasks to assembleDebug so the matrix stays the same but builds debug APKs
+          DEBUG_MODULES="$(echo "$MODULES" | sed 's/assembleRelease/assembleDebug/g')"
+          # if the generator produced tasks that include release assemble tasks, the replacement will work.
+          # otherwise, if DEBUG_MODULES is empty (unlikely) fallback to a full debug assemble:
+          if [ -z "$DEBUG_MODULES" ]; then
+            echo "DEBUG_MODULES empty — running a safe assembleDebug for the whole project"
+            ./gradlew assembleDebug
+          else
+            echo "Running: ./gradlew $DEBUG_MODULES"
+            ./gradlew $DEBUG_MODULES
+          fi
+
+      - name: Upload chunk APKs (${{ matrix.chunk.number }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: "individual-debug-apks-${{ matrix.chunk.number }}"
+          path: "**/*.apk"
+          retention-days: 7
+
+      - name: Upload Gradle problems report (for debug)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "gradle-problems-report-${{ matrix.chunk.number }}"
+          path: build/reports/problems/**
+          retention-days: 7
