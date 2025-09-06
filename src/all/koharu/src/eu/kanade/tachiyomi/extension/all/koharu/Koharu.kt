@@ -59,7 +59,6 @@ import uy.kohesive.injekt.injectLazy
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit // Corrected: Re-added the missing import
 
 class Koharu(
     override val lang: String = "all",
@@ -214,7 +213,7 @@ class Koharu(
             }
 
             if (resolved) {
-                latch.await(5, TimeUnit.SECONDS)
+                latch.await()
             }
 
             handler.post {
