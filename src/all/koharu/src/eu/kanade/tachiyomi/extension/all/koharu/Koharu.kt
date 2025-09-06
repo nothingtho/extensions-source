@@ -54,6 +54,7 @@ import okhttp3.Response
 import rx.Observable
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import uy.kohesive.injekt.injectLazy
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
@@ -124,12 +125,11 @@ class Koharu(
                 customUA = preferences.getPrefCustomUA(),
                 filterInclude = listOf("chrome"),
             )
-            .addInterceptor(CloudflareInterceptor()) // Add our custom interceptor
+            .addInterceptor(CloudflareInterceptor())
             .rateLimit(3)
             .build()
     }
 
-    // Custom Cloudflare Interceptor
     private inner class CloudflareInterceptor : Interceptor {
         private val handler = Handler(Looper.getMainLooper())
 
@@ -138,8 +138,7 @@ class Koharu(
             val originalRequest = chain.request()
             val response = chain.proceed(originalRequest)
 
-            // Check if Cloudflare is blocking us
-            if (response.code != 503 && response.code != 403) {
+            if (response.code !in listOf(503, 403)) {
                 return response
             }
 
@@ -148,7 +147,6 @@ class Koharu(
                 return response
             }
 
-            // Close the previous response body
             response.close()
 
             var webView: WebView? = null
@@ -165,21 +163,15 @@ class Koharu(
                 }
                 CookieManager.getInstance().setAcceptCookie(true)
 
-                wv.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView, url: String) {
-                        // This is a continuous check, not a one-off
-                    }
-                }
+                wv.webViewClient = object : WebViewClient() {}
                 wv.loadUrl(originalRequest.url.toString())
             }
 
-            // Wait until the cf_clearance cookie is found, or timeout
             var resolved = false
-            for (i in 1..60) { // Timeout after 2 minutes (60 * 2 seconds)
-                Thread.sleep(2000) // Check every 2 seconds
+            for (i in 1..60) {
+                Thread.sleep(2000)
                 val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
                 if (cookies != null && "cf_clearance" in cookies) {
-                    // Success! We got the cookie.
                     val cookieJar = client.cookieJar
                     val httpUrl = originalRequest.url
                     val parsedCookies = cookies.split("; ").mapNotNull { Cookie.parse(httpUrl, it) }
@@ -190,7 +182,6 @@ class Koharu(
                 }
             }
 
-            // Clean up the WebView
             handler.post {
                 webView?.stopLoading()
                 webView?.destroy()
@@ -200,7 +191,6 @@ class Koharu(
                 throw Exception("Failed to solve Cloudflare challenge.")
             }
 
-            // Retry the original request with the new cookies
             return chain.proceed(originalRequest)
         }
     }
