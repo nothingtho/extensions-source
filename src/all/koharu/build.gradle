@@ -1,8 +1,12 @@
 ext {
-    extName = 'SchaleNetwork'
+    extName = 'Niyaniya'
     extClass = '.KoharuFactory'
-    extVersionCode = 15
+    extVersionCode = 16
     isNsfw = true
 }
 
 apply from: "$rootDir/common.gradle"
+
+dependencies {
+    implementation(project(":lib-randomua"))
+}
