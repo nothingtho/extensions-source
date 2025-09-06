@@ -90,6 +90,9 @@ class Koharu(
 
     private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
 
+    // This will hold our custom site-specific token
+    private var crtToken: String? = null
+
     private var _domainUrl: String? = null
     private val domainUrl: String
         get() {
@@ -126,11 +129,37 @@ class Koharu(
                 customUA = preferences.getPrefCustomUA(),
                 filterInclude = listOf("chrome"),
             )
-            .addInterceptor(CloudflareInterceptor())
+            .addInterceptor(CrtInterceptor()) // Interceptor to add the CRT token
+            .addInterceptor(CloudflareInterceptor()) // Interceptor to solve CF challenges
             .rateLimit(3)
             .build()
     }
 
+    // This interceptor adds the site's custom `crt` token to API requests
+    private inner class CrtInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            if (crtToken == null) {
+                return chain.proceed(chain.request())
+            }
+
+            val originalUrl = chain.request().url
+            if (!originalUrl.toString().startsWith(apiUrl)) {
+                return chain.proceed(chain.request())
+            }
+
+            val newUrl = originalUrl.newBuilder()
+                .addQueryParameter("crt", crtToken)
+                .build()
+
+            val newRequest = chain.request().newBuilder()
+                .url(newUrl)
+                .build()
+
+            return chain.proceed(newRequest)
+        }
+    }
+
+    // This interceptor solves Cloudflare challenges and scrapes the `crt` token
     private inner class CloudflareInterceptor : Interceptor {
         private val handler = Handler(Looper.getMainLooper())
 
@@ -146,7 +175,6 @@ class Koharu(
             val body = try { response.body.string() } catch (e: Exception) { "" }
 
             if (!body.contains("cf-challenge-running", true)) {
-                // This is the fix: Rebuild the response with a new body
                 val newBody = body.toResponseBody(response.body.contentType())
                 return response.newBuilder().body(newBody).build()
             }
@@ -176,14 +204,20 @@ class Koharu(
                 Thread.sleep(2000)
                 val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
                 if (cookies != null && "cf_clearance" in cookies) {
-                    val cookieJar = client.cookieJar
-                    val httpUrl = originalRequest.url
-                    val parsedCookies = cookies.split("; ").mapNotNull { Cookie.parse(httpUrl, it) }
-                    cookieJar.saveFromResponse(httpUrl, parsedCookies)
+                    // Success! Now also get the crt token from localStorage
+                    handler.post {
+                        webView?.evaluateJavascript("window.localStorage.getItem('clearance')") {
+                            crtToken = it.takeUnless { it == "null" }?.removeSurrounding("\"")
+                            latch.countDown()
+                        }
+                    }
                     resolved = true
-                    latch.countDown()
                     break
                 }
+            }
+
+            if (resolved) {
+                latch.await(5, TimeUnit.SECONDS) // Wait for JS evaluation
             }
 
             handler.post {
