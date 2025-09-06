@@ -1,12 +1,6 @@
 package eu.kanade.tachiyomi.extension.all.koharu
 
-import android.annotation.SuppressLint
-import android.app.Application
 import android.content.SharedPreferences
-import android.os.Handler
-import android.os.Looper
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -22,7 +16,6 @@ import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.otherList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.parodyList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetchAttempts
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetched
-// Added: Imports from the random User-Agent library
 import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
 import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
 import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
@@ -113,7 +106,6 @@ class Koharu(
             .build()
     }
 
-    // Changed: Replaced the old client system with the modern one from nHentai
     override val client: OkHttpClient by lazy {
         network.cloudflareClient.newBuilder()
             .setRandomUserAgent(
@@ -124,10 +116,6 @@ class Koharu(
             .rateLimit(3)
             .build()
     }
-
-    // Removed: The entire old `clearanceClient` property is gone.
-
-    // Removed: The entire old `getClearance` function is gone.
 
     private fun getManga(book: Entry) = SManga.create().apply {
         setUrlWithoutDomain("${book.id}/${book.key}")
@@ -168,8 +156,7 @@ class Koharu(
             data.`780`?.id -> "780"
             else -> "0"
         }
-        
-        // Changed: Use the new unified `client`
+
         val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", lazyHeaders)).execute()
         val images = imagesResponse.parseAs<ImagesInfo>() to realQuality
         return images
@@ -379,7 +366,6 @@ class Koharu(
     // Page List
 
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        // Changed: Use the new unified `client`
         return client.newCall(pageListRequest(chapter))
             .asObservableSuccess()
             .map { response ->
@@ -435,8 +421,7 @@ class Koharu(
             summary = "Separate tags with commas (,).\n" +
                 "Excluding: ${alwaysExcludeTags()}"
         }.also(screen::addPreference)
-        
-        // Added: User-Agent preference from nHentai
+
         addRandomUAPreferenceToScreen(screen)
     }
 
