@@ -119,7 +119,8 @@ class Koharu(
     }
 
     override val client: OkHttpClient by lazy {
-        network.baseClient.newBuilder()
+        // Corrected: Use `network.client` instead of the non-existent `network.baseClient`
+        network.client.newBuilder()
             .setRandomUserAgent(
                 userAgentType = preferences.getPrefUAType(),
                 customUA = preferences.getPrefCustomUA(),
