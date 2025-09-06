@@ -1,6 +1,13 @@
 package eu.kanade.tachiyomi.extension.all.koharu
 
+import android.annotation.SuppressLint
+import android.app.Application
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
+import android.webkit.CookieManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -37,15 +44,19 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
-import uy.kohesive.injekt.injectLazy
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
 
 class Koharu(
     override val lang: String = "all",
@@ -107,14 +118,91 @@ class Koharu(
     }
 
     override val client: OkHttpClient by lazy {
-        network.cloudflareClient.newBuilder()
+        network.baseClient.newBuilder()
             .setRandomUserAgent(
                 userAgentType = preferences.getPrefUAType(),
                 customUA = preferences.getPrefCustomUA(),
                 filterInclude = listOf("chrome"),
             )
+            .addInterceptor(CloudflareInterceptor()) // Add our custom interceptor
             .rateLimit(3)
             .build()
+    }
+
+    // Custom Cloudflare Interceptor
+    private inner class CloudflareInterceptor : Interceptor {
+        private val handler = Handler(Looper.getMainLooper())
+
+        @SuppressLint("SetJavaScriptEnabled")
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val originalRequest = chain.request()
+            val response = chain.proceed(originalRequest)
+
+            // Check if Cloudflare is blocking us
+            if (response.code != 503 && response.code != 403) {
+                return response
+            }
+
+            val body = try { response.body.string() } catch (e: Exception) { "" }
+            if (!body.contains("cf-challenge-running", true)) {
+                return response
+            }
+
+            // Close the previous response body
+            response.close()
+
+            var webView: WebView? = null
+            val latch = CountDownLatch(1)
+
+            handler.post {
+                val wv = WebView(Injekt.get<Application>())
+                webView = wv
+                wv.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+                }
+                CookieManager.getInstance().setAcceptCookie(true)
+
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String) {
+                        // This is a continuous check, not a one-off
+                    }
+                }
+                wv.loadUrl(originalRequest.url.toString())
+            }
+
+            // Wait until the cf_clearance cookie is found, or timeout
+            var resolved = false
+            for (i in 1..60) { // Timeout after 2 minutes (60 * 2 seconds)
+                Thread.sleep(2000) // Check every 2 seconds
+                val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
+                if (cookies != null && "cf_clearance" in cookies) {
+                    // Success! We got the cookie.
+                    val cookieJar = client.cookieJar
+                    val httpUrl = originalRequest.url
+                    val parsedCookies = cookies.split("; ").mapNotNull { Cookie.parse(httpUrl, it) }
+                    cookieJar.saveFromResponse(httpUrl, parsedCookies)
+                    resolved = true
+                    latch.countDown()
+                    break
+                }
+            }
+
+            // Clean up the WebView
+            handler.post {
+                webView?.stopLoading()
+                webView?.destroy()
+            }
+
+            if (!resolved) {
+                throw Exception("Failed to solve Cloudflare challenge.")
+            }
+
+            // Retry the original request with the new cookies
+            return chain.proceed(originalRequest)
+        }
     }
 
     private fun getManga(book: Entry) = SManga.create().apply {
