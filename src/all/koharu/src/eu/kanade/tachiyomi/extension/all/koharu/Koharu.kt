@@ -51,6 +51,7 @@ import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import rx.Observable
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
@@ -119,7 +120,6 @@ class Koharu(
     }
 
     override val client: OkHttpClient by lazy {
-        // Corrected: Use `network.client` instead of the non-existent `network.baseClient`
         network.client.newBuilder()
             .setRandomUserAgent(
                 userAgentType = preferences.getPrefUAType(),
@@ -144,8 +144,11 @@ class Koharu(
             }
 
             val body = try { response.body.string() } catch (e: Exception) { "" }
+
             if (!body.contains("cf-challenge-running", true)) {
-                return response
+                // This is the fix: Rebuild the response with a new body
+                val newBody = body.toResponseBody(response.body.contentType())
+                return response.newBuilder().body(newBody).build()
             }
 
             response.close()
