@@ -22,6 +22,11 @@ import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.otherList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.parodyList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetchAttempts
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetched
+// Added: Imports from the random User-Agent library
+import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
+import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
+import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
+import eu.kanade.tachiyomi.lib.randomua.setRandomUserAgent
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
@@ -46,11 +51,8 @@ import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
 import uy.kohesive.injekt.injectLazy
-import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 class Koharu(
     override val lang: String = "all",
@@ -94,7 +96,7 @@ class Koharu(
 
     private fun getDomain(): String {
         try {
-            val noRedirectClient = client.newBuilder().followRedirects(false).build()
+            val noRedirectClient = super.client.newBuilder().followRedirects(false).build()
             val host = noRedirectClient.newCall(GET(baseUrl, headers)).execute()
                 .headers["Location"]?.toHttpUrlOrNull()?.host
                 ?: return baseUrl
@@ -111,67 +113,21 @@ class Koharu(
             .build()
     }
 
-    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .rateLimit(3)
-        .build()
-
-    private val clearanceClient = network.cloudflareClient.newBuilder()
-        .addInterceptor { chain ->
-            val request = chain.request()
-            val url = request.url
-            val clearance = getClearance()
-                ?: throw IOException("Open webview to refresh token")
-
-            val newUrl = url.newBuilder()
-                .setQueryParameter("crt", clearance)
-                .build()
-            val newRequest = request.newBuilder()
-                .url(newUrl)
-                .build()
-
-            val response = chain.proceed(newRequest)
-
-            if (response.code !in listOf(400, 403)) {
-                return@addInterceptor response
-            }
-            response.close()
-            _clearance = null
-            throw IOException("Open webview to refresh token")
-        }
-        .rateLimit(3)
-        .build()
-
-    private val context: Application by injectLazy()
-    private val handler by lazy { Handler(Looper.getMainLooper()) }
-    private var _clearance: String? = null
-
-    @SuppressLint("SetJavaScriptEnabled")
-    fun getClearance(): String? {
-        _clearance?.also { return it }
-        val latch = CountDownLatch(1)
-        handler.post {
-            val webview = WebView(context)
-            with(webview.settings) {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                databaseEnabled = true
-                blockNetworkImage = true
-            }
-            webview.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    view!!.evaluateJavascript("window.localStorage.getItem('clearance')") { clearance ->
-                        webview.stopLoading()
-                        webview.destroy()
-                        _clearance = clearance.takeUnless { it == "null" }?.removeSurrounding("\"")
-                        latch.countDown()
-                    }
-                }
-            }
-            webview.loadUrl("$domainUrl/")
-        }
-        latch.await(10, TimeUnit.SECONDS)
-        return _clearance
+    // Changed: Replaced the old client system with the modern one from nHentai
+    override val client: OkHttpClient by lazy {
+        network.cloudflareClient.newBuilder()
+            .setRandomUserAgent(
+                userAgentType = preferences.getPrefUAType(),
+                customUA = preferences.getPrefCustomUA(),
+                filterInclude = listOf("chrome"),
+            )
+            .rateLimit(3)
+            .build()
     }
+
+    // Removed: The entire old `clearanceClient` property is gone.
+
+    // Removed: The entire old `getClearance` function is gone.
 
     private fun getManga(book: Entry) = SManga.create().apply {
         setUrlWithoutDomain("${book.id}/${book.key}")
@@ -212,8 +168,9 @@ class Koharu(
             data.`780`?.id -> "780"
             else -> "0"
         }
-
-        val imagesResponse = clearanceClient.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", lazyHeaders)).execute()
+        
+        // Changed: Use the new unified `client`
+        val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", lazyHeaders)).execute()
         val images = imagesResponse.parseAs<ImagesInfo>() to realQuality
         return images
     }
@@ -355,9 +312,6 @@ class Koharu(
 
     private fun launchIO(block: () -> Unit) = scope.launch { block() }
 
-    /**
-     * Fetch the genres from the source to be used in the filters.
-     */
     private fun fetchTags() {
         if (tagsFetchAttempts < 3 && !tagsFetched) {
             try {
@@ -425,7 +379,8 @@ class Koharu(
     // Page List
 
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return clearanceClient.newCall(pageListRequest(chapter))
+        // Changed: Use the new unified `client`
+        return client.newCall(pageListRequest(chapter))
             .asObservableSuccess()
             .map { response ->
                 pageListParse(response)
@@ -480,6 +435,9 @@ class Koharu(
             summary = "Separate tags with commas (,).\n" +
                 "Excluding: ${alwaysExcludeTags()}"
         }.also(screen::addPreference)
+        
+        // Added: User-Agent preference from nHentai
+        addRandomUAPreferenceToScreen(screen)
     }
 
     private inline fun <reified T> Response.parseAs(): T {
