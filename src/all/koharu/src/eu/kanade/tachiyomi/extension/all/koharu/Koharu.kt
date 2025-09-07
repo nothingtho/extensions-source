@@ -23,10 +23,10 @@ import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.otherList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.parodyList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetchAttempts
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetched
+import eu.kanade.tachiyomi.lib.randomua.RandomUserAgent
 import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
 import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
 import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
-import eu.kanade.tachiyomi.lib.randomua.setRandomUserAgent
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
@@ -103,36 +103,51 @@ class Koharu(
         }
     }
 
-    private val lazyHeaders by lazy {
+    private val defaultUserAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+
+    override val headers by lazy {
         headersBuilder()
             .set("Referer", "$domainUrl/")
             .set("Origin", domainUrl)
-            // Set the new default User-Agent
-            .set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36")
+            .set("User-Agent", defaultUserAgent)
             .build()
     }
 
     private val webViewCookieJar = WebViewCookieJar()
 
     override val client: OkHttpClient by lazy {
-        val builder = network.client.newBuilder()
+        network.client.newBuilder()
             .cookieJar(webViewCookieJar)
             .addInterceptor(CrtInterceptor())
-            .addInterceptor(CloudflareInterceptor()) // Keep your custom interceptor
+            .addInterceptor(CloudflareInterceptor())
+            .addInterceptor(::userAgentInterceptor) // Add our custom UA interceptor
             .rateLimit(3)
+            .build()
+    }
 
-        // Check user preferences. Only use Random UA if the user has selected something.
+    // This new interceptor replaces the randomua library's helper function.
+    // It will only activate if the user selects a non-default UA in settings.
+    private fun userAgentInterceptor(chain: Interceptor.Chain): Response {
+        val originalRequest = chain.request()
+
         val uaType = preferences.getPrefUAType()
-        if (uaType.isNotEmpty()) {
-            builder.setRandomUserAgent(
-                userAgentType = uaType,
-                customUA = preferences.getPrefCustomUA(),
-                filterInclude = listOf("chrome"),
-                cloudflareBypass = false, // Disable the library's Cloudflare bypass
-            )
+        if (uaType.isNullOrEmpty()) { // Correct null/empty check
+            return chain.proceed(originalRequest)
         }
 
-        builder.build()
+        val newUserAgent = when (uaType) {
+            "custom" -> preferences.getPrefCustomUA()
+            else -> RandomUserAgent.next(uaType, filterInclude = listOf("chrome"))
+        }
+
+        if (newUserAgent.isNullOrEmpty()) {
+            return chain.proceed(originalRequest)
+        }
+
+        val newRequest = originalRequest.newBuilder()
+            .header("User-Agent", newUserAgent)
+            .build()
+        return chain.proceed(newRequest)
     }
 
     private inner class CrtInterceptor : Interceptor {
@@ -156,7 +171,6 @@ class Koharu(
         }
     }
 
-    // Keep this custom interceptor as it is the one that works for the site.
     private inner class CloudflareInterceptor : Interceptor {
         private val handler = Handler(Looper.getMainLooper())
 
@@ -165,7 +179,6 @@ class Koharu(
             val originalRequest = chain.request()
             val response = chain.proceed(originalRequest)
 
-            // Check if Cloudflare protection is active
             if (response.code !in listOf(503, 403) || response.header("Server")?.equals("cloudflare", true) != true) {
                 return response
             }
@@ -201,7 +214,6 @@ class Koharu(
                     wv.loadUrl(originalRequest.url.toString())
                 }
 
-                // Wait for the WebView to solve the challenge
                 if (!latch.await(60, TimeUnit.SECONDS)) {
                     throw IOException("WebView timed out.")
                 }
@@ -214,7 +226,6 @@ class Koharu(
                 throw IOException("Failed to solve Cloudflare challenge. ${e.message}")
             }
 
-            // Retry the original request, now with the cookies from the WebView
             return chain.proceed(originalRequest)
         }
     }
@@ -259,7 +270,7 @@ class Koharu(
             else -> "0"
         }
 
-        val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", lazyHeaders)).execute()
+        val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", headers)).execute()
         val images = imagesResponse.parseAs<ImagesInfo>() to realQuality
         return images
     }
@@ -277,7 +288,7 @@ class Koharu(
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
-        lazyHeaders,
+        headers,
     )
 
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
@@ -296,7 +307,7 @@ class Koharu(
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
-        lazyHeaders,
+        headers,
     )
 
     override fun popularMangaParse(response: Response): MangasPage {
@@ -308,7 +319,7 @@ class Koharu(
         return when {
             query.startsWith(PREFIX_ID_KEY_SEARCH) -> {
                 val ipk = query.removePrefix(PREFIX_ID_KEY_SEARCH)
-                val response = client.newCall(GET("$apiBooksUrl/detail/$ipk", lazyHeaders)).execute()
+                val response = client.newCall(GET("$apiBooksUrl/detail/$ipk", headers)).execute()
                 Observable.just(
                     MangasPage(listOf(mangaDetailsParse(response)), false),
                 )
@@ -376,7 +387,7 @@ class Koharu(
             addQueryParameter("page", page.toString())
         }.build()
 
-        return GET(url, lazyHeaders)
+        return GET(url, headers)
     }
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
@@ -394,7 +405,7 @@ class Koharu(
         if (tagsFetchAttempts < 3 && !tagsFetched) {
             try {
                 client.newCall(
-                    GET("$apiBooksUrl/tags/filters", lazyHeaders),
+                    GET("$apiBooksUrl/tags/filters", headers),
                 ).execute()
                     .use { it.parseAs<List<Filter>>() }
                     .also { tagsFetched = true }
@@ -417,7 +428,7 @@ class Koharu(
         }
     }
 
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", lazyHeaders)
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", headers)
 
     override fun mangaDetailsParse(response: Response): SManga {
         val mangaDetail = response.parseAs<MangaDetail>()
@@ -429,7 +440,7 @@ class Koharu(
 
     override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
 
-    override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", lazyHeaders)
+    override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", headers)
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val manga = response.parseAs<MangaDetail>()
@@ -450,7 +461,7 @@ class Koharu(
             .map(::pageListParse)
     }
 
-    override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", lazyHeaders)
+    override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
         val mangaData = response.parseAs<MangaData>()
@@ -465,7 +476,7 @@ class Koharu(
         }
     }
 
-    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, lazyHeaders)
+    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers)
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 
