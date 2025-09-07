@@ -156,6 +156,7 @@ class Koharu(
             val originalRequest = chain.request()
             val response = chain.proceed(originalRequest)
 
+            // Check if Cloudflare protection is active
             if (response.code !in listOf(503, 403) || !response.header("Server", "").equals("cloudflare", true)) {
                 return response
             }
@@ -191,6 +192,7 @@ class Koharu(
                     wv.loadUrl(originalRequest.url.toString())
                 }
 
+                // Wait for the WebView to solve the challenge
                 latch.await(60, TimeUnit.SECONDS)
 
                 handler.post {
@@ -201,6 +203,7 @@ class Koharu(
                 throw IOException("Failed to solve Cloudflare challenge. ${e.message}")
             }
 
+            // Retry the original request, now with the cookies from the WebView
             return chain.proceed(originalRequest)
         }
     }
@@ -413,11 +416,11 @@ class Koharu(
         }
     }
 
-    // FIX: Corrected function name and return type
-    override fun relatedMangaParse(response: Response): MangasPage {
+    // FIX for 'overrides nothing' compilation error
+    override fun fetchSimilarManga(manga: SManga): Observable<MangasPage> {
         // The API doesn't provide a list of related manga.
         // Return an empty page to prevent the app from crashing.
-        return MangasPage(emptyList(), false)
+        return Observable.just(MangasPage(emptyList(), false))
     }
 
     override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
