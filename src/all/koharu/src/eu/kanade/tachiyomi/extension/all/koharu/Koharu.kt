@@ -181,6 +181,7 @@ class Koharu(
                         override fun onPageFinished(view: WebView?, url: String?) {
                             val cookies = CookieManager.getInstance().getCookie(url)
                             if (cookies != null && "cf_clearance" in cookies) {
+                                // This logic is now inside onPageFinished for reliability
                                 val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
                                 if (clearanceCookie != null) {
                                     crtToken = clearanceCookie.substringAfter("=").trim()
@@ -418,7 +419,8 @@ class Koharu(
         }
     }
 
-    // FIX for 'overrides nothing' compilation error
+    // FIX for the JSON parsing crash.
+    // This is the correct function to override.
     override fun similarMangaParse(response: Response): MangasPage {
         // The API doesn't provide a list of related manga.
         // Return an empty page to prevent the app from crashing.
