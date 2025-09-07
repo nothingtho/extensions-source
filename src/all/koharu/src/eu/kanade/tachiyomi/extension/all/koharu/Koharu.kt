@@ -40,6 +40,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
@@ -99,11 +100,10 @@ class Koharu(
         }
     }
 
-    override val headers by lazy {
-        headersBuilder()
+    private fun apiHeaders(): Headers {
+        return headersBuilder()
             .set("Referer", "$domainUrl/")
             .set("Origin", domainUrl)
-            .set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36")
             .build()
     }
 
@@ -238,7 +238,7 @@ class Koharu(
             else -> "0"
         }
 
-        val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", headers)).execute()
+        val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", apiHeaders())).execute()
         val images = imagesResponse.parseAs<ImagesInfo>() to realQuality
         return images
     }
@@ -256,7 +256,7 @@ class Koharu(
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
-        headers,
+        apiHeaders(),
     )
 
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
@@ -275,7 +275,7 @@ class Koharu(
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
-        headers,
+        apiHeaders(),
     )
 
     override fun popularMangaParse(response: Response): MangasPage {
@@ -287,7 +287,7 @@ class Koharu(
         return when {
             query.startsWith(PREFIX_ID_KEY_SEARCH) -> {
                 val ipk = query.removePrefix(PREFIX_ID_KEY_SEARCH)
-                val response = client.newCall(GET("$apiBooksUrl/detail/$ipk", headers)).execute()
+                val response = client.newCall(GET("$apiBooksUrl/detail/$ipk", apiHeaders())).execute()
                 Observable.just(
                     MangasPage(listOf(mangaDetailsParse(response)), false),
                 )
@@ -355,7 +355,7 @@ class Koharu(
             addQueryParameter("page", page.toString())
         }.build()
 
-        return GET(url, headers)
+        return GET(url, apiHeaders())
     }
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
@@ -373,7 +373,7 @@ class Koharu(
         if (tagsFetchAttempts < 3 && !tagsFetched) {
             try {
                 client.newCall(
-                    GET("$apiBooksUrl/tags/filters", headers),
+                    GET("$apiBooksUrl/tags/filters", apiHeaders()),
                 ).execute()
                     .use { it.parseAs<List<Filter>>() }
                     .also { tagsFetched = true }
@@ -396,7 +396,7 @@ class Koharu(
         }
     }
 
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", headers)
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", apiHeaders())
 
     override fun mangaDetailsParse(response: Response): SManga {
         val mangaDetail = response.parseAs<MangaDetail>()
@@ -408,7 +408,7 @@ class Koharu(
 
     override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
 
-    override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", headers)
+    override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", apiHeaders())
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val manga = response.parseAs<MangaDetail>()
@@ -429,7 +429,7 @@ class Koharu(
             .map(::pageListParse)
     }
 
-    override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", headers)
+    override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", apiHeaders())
 
     override fun pageListParse(response: Response): List<Page> {
         val mangaData = response.parseAs<MangaData>()
@@ -444,7 +444,7 @@ class Koharu(
         }
     }
 
-    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers)
+    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, apiHeaders())
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 
