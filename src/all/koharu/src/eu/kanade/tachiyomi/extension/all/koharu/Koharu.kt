@@ -50,7 +50,6 @@ import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.toResponseBody
 import rx.Observable
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
@@ -416,13 +415,6 @@ class Koharu(
             setUrlWithoutDomain("${mangaDetail.id}/${mangaDetail.key}")
             title = if (remadd()) mangaDetail.title.shortenTitle() else mangaDetail.title
         }
-    }
-
-    // FIX for the JSON parsing crash.
-    // This is the correct function to override to prevent the app from
-    // trying to parse a single-manga response as a list of manga.
-    override fun similarMangaParse(response: Response): MangasPage {
-        return MangasPage(emptyList(), false)
     }
 
     override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
