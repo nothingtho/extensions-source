@@ -156,71 +156,49 @@ class Koharu(
             val originalRequest = chain.request()
             val response = chain.proceed(originalRequest)
 
-            if (response.code !in listOf(503, 403)) {
+            if (response.code !in listOf(503, 403) || !response.header("Server", "").equals("cloudflare", true)) {
                 return response
             }
 
-            val body = try { response.body.string() } catch (e: Exception) { "" }
-
-            if (!body.contains("cf-challenge-running", true)) {
-                val newBody = body.toResponseBody(response.body.contentType())
-                return response.newBuilder().body(newBody).build()
-            }
-
             response.close()
+            try {
+                var webView: WebView? = null
+                val latch = CountDownLatch(1)
 
-            var webView: WebView? = null
-            val latch = CountDownLatch(1)
-
-            handler.post {
-                val wv = WebView(Injekt.get<Application>())
-                webView = wv
-                wv.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
-                }
-                CookieManager.getInstance().setAcceptCookie(true)
-
-                wv.webViewClient = object : WebViewClient() {}
-                wv.loadUrl(originalRequest.url.toString())
-            }
-
-            var resolved = false
-            for (i in 1..60) {
-                Thread.sleep(2000)
-                val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
-                
-                // === START OF THE FIX ===
-                // Instead of checking localStorage, parse the cookie string directly.
-                if (cookies != null && "cf_clearance" in cookies) {
-                    val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
-
-                    if (clearanceCookie != null) {
-                        // Extract the value after the '='
-                        crtToken = clearanceCookie.substringAfter("=").trim()
-
-                        // We have the token, we're done here.
-                        resolved = true
-                        latch.countDown()
-                        break
+                handler.post {
+                    val wv = WebView(Injekt.get<Application>())
+                    webView = wv
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                     }
+                    CookieManager.getInstance().setAcceptCookie(true)
+
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            val cookies = CookieManager.getInstance().getCookie(url)
+                            if (cookies != null && "cf_clearance" in cookies) {
+                                val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
+                                if (clearanceCookie != null) {
+                                    crtToken = clearanceCookie.substringAfter("=").trim()
+                                    latch.countDown()
+                                }
+                            }
+                        }
+                    }
+                    wv.loadUrl(originalRequest.url.toString())
                 }
-                // === END OF THE FIX ===
-            }
 
-            if (resolved) {
-                latch.await(10, TimeUnit.SECONDS)
-            }
+                latch.await(60, TimeUnit.SECONDS)
 
-            handler.post {
-                webView?.stopLoading()
-                webView?.destroy()
-            }
-
-            if (!resolved) {
-                throw IOException("Failed to solve Cloudflare challenge.")
+                handler.post {
+                    webView?.stopLoading()
+                    webView?.destroy()
+                }
+            } catch (e: Exception) {
+                throw IOException("Failed to solve Cloudflare challenge. ${e.message}")
             }
 
             return chain.proceed(originalRequest)
@@ -435,7 +413,12 @@ class Koharu(
         }
     }
 
-    override fun relatedMangaListParse(response: Response): List<SManga> = emptyList()
+    // FIX: Corrected function name and return type
+    override fun relatedMangaParse(response: Response): MangasPage {
+        // The API doesn't provide a list of related manga.
+        // Return an empty page to prevent the app from crashing.
+        return MangasPage(emptyList(), false)
+    }
 
     override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
 
