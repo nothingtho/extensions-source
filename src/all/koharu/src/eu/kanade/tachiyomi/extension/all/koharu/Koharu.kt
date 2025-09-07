@@ -67,45 +67,34 @@ class Koharu(
 ) : HttpSource(), ConfigurableSource {
 
     override val name = "Niyaniya"
-
     override val baseUrl = "https://niyaniya.moe"
-
     override val id = if (lang == "en") 1484902275639232927 else super.id
-
     private val apiUrl = "https://api.schale.network"
-
     private val apiBooksUrl = "$apiUrl/books"
-
     override val supportsLatest = true
 
     private val json: Json by injectLazy()
+    private val preferences: SharedPreferences by getPreferencesLazy()
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
-
-    private val preferences: SharedPreferences by getPreferencesLazy()
-
     private fun quality() = preferences.getString(PREF_IMAGERES, "1280")!!
-
     private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
-
     private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
 
     private var crtToken: String? = null
-
     private var _domainUrl: String? = null
+
     private val domainUrl: String
-        get() {
-            return _domainUrl ?: run {
-                val domain = getDomain()
-                _domainUrl = domain
-                domain
-            }
+        get() = _domainUrl ?: run {
+            val domain = getDomain()
+            _domainUrl = domain
+            domain
         }
 
     private fun getDomain(): String {
         try {
-            val noRedirectClient = super.client.newBuilder().followRedirects(false).build()
+            val noRedirectClient = network.client.newBuilder().followRedirects(false).build()
             val host = noRedirectClient.newCall(GET(baseUrl, headers)).execute()
                 .headers["Location"]?.toHttpUrlOrNull()?.host
                 ?: return baseUrl
@@ -122,20 +111,22 @@ class Koharu(
             .build()
     }
 
+    private val webViewCookieJar = WebViewCookieJar()
+
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
+            .cookieJar(webViewCookieJar)
             .setRandomUserAgent(
                 userAgentType = preferences.getPrefUAType(),
                 customUA = preferences.getPrefCustomUA(),
                 filterInclude = listOf("chrome"),
             )
-            .addInterceptor(CrtInterceptor()) // The "Keymaster"
-            .addInterceptor(CloudflareInterceptor()) // The "Gatecrasher"
+            .addInterceptor(CrtInterceptor())
+            .addInterceptor(CloudflareInterceptor())
             .rateLimit(3)
             .build()
     }
 
-    // The "Keymaster": Adds the site's custom `crt` token to API requests.
     private inner class CrtInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val token = crtToken ?: return chain.proceed(chain.request())
@@ -157,7 +148,6 @@ class Koharu(
         }
     }
 
-    // The "Gatecrasher": Solves Cloudflare and acquires both keys.
     private inner class CloudflareInterceptor : Interceptor {
         private val handler = Handler(Looper.getMainLooper())
 
@@ -189,7 +179,7 @@ class Koharu(
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     databaseEnabled = true
-                    userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+                    userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                 }
                 CookieManager.getInstance().setAcceptCookie(true)
 
@@ -201,20 +191,27 @@ class Koharu(
             for (i in 1..60) {
                 Thread.sleep(2000)
                 val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
+                
+                // === START OF THE FIX ===
+                // Instead of checking localStorage, parse the cookie string directly.
                 if (cookies != null && "cf_clearance" in cookies) {
-                    handler.post {
-                        webView?.evaluateJavascript("window.localStorage.getItem('clearance')") {
-                            crtToken = it.takeUnless { it == "null" }?.removeSurrounding("\"")
-                            latch.countDown()
-                        }
+                    val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
+
+                    if (clearanceCookie != null) {
+                        // Extract the value after the '='
+                        crtToken = clearanceCookie.substringAfter("=").trim()
+
+                        // We have the token, we're done here.
+                        resolved = true
+                        latch.countDown()
+                        break
                     }
-                    resolved = true
-                    break
                 }
+                // === END OF THE FIX ===
             }
 
             if (resolved) {
-                latch.await(5, TimeUnit.SECONDS)
+                latch.await(10, TimeUnit.SECONDS)
             }
 
             handler.post {
@@ -275,8 +272,6 @@ class Koharu(
         return images
     }
 
-    // Latest
-
     override fun latestUpdatesRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
@@ -294,8 +289,6 @@ class Koharu(
     )
 
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
-
-    // Popular
 
     override fun popularMangaRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
@@ -318,8 +311,6 @@ class Koharu(
         val data = response.parseAs<Books>()
         return MangasPage(data.entries.map(::getManga), data.page * data.limit < data.total)
     }
-
-    // Search
 
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
         return when {
@@ -350,14 +341,12 @@ class Koharu(
             filters.forEach { filter ->
                 when (filter) {
                     is KoharuFilters.SortFilter -> addQueryParameter("sort", filter.getValue())
-
                     is KoharuFilters.CategoryFilter -> {
                         val activeFilter = filter.state.filter { it.state }
                         if (activeFilter.isNotEmpty()) {
                             addQueryParameter("cat", activeFilter.sumOf { it.value }.toString())
                         }
                     }
-
                     is KoharuFilters.TagFilter -> {
                         includedTags += filter.state
                             .filter { it.isIncluded() }
@@ -366,13 +355,11 @@ class Koharu(
                             .filter { it.isExcluded() }
                             .map { it.id }
                     }
-
                     is KoharuFilters.GenreConditionFilter -> {
                         if (filter.state > 0) {
                             addQueryParameter(filter.param, filter.toUriPart())
                         }
                     }
-
                     is KoharuFilters.TextFilter -> {
                         if (filter.state.isNotEmpty()) {
                             val tags = filter.state.split(",").filter(String::isNotBlank).joinToString(",")
@@ -404,7 +391,6 @@ class Koharu(
 
     override fun getFilterList(): FilterList {
         launchIO { fetchTags() }
-
         return getFilters()
     }
 
@@ -419,9 +405,7 @@ class Koharu(
                     GET("$apiBooksUrl/tags/filters", lazyHeaders),
                 ).execute()
                     .use { it.parseAs<List<Filter>>() }
-                    .also {
-                        tagsFetched = true
-                    }
+                    .also { tagsFetched = true }
                     .takeIf { it.isNotEmpty() }
                     ?.map { it.toTag() }
                     ?.also { tags ->
@@ -441,11 +425,7 @@ class Koharu(
         }
     }
 
-    // Details
-
-    override fun mangaDetailsRequest(manga: SManga): Request {
-        return GET("$apiBooksUrl/detail/${manga.url}", lazyHeaders)
-    }
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", lazyHeaders)
 
     override fun mangaDetailsParse(response: Response): SManga {
         val mangaDetail = response.parseAs<MangaDetail>()
@@ -455,13 +435,11 @@ class Koharu(
         }
     }
 
+    override fun relatedMangaListParse(response: Response): List<SManga> = emptyList()
+
     override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
 
-    // Chapter
-
-    override fun chapterListRequest(manga: SManga): Request {
-        return GET("$apiBooksUrl/detail/${manga.url}", lazyHeaders)
-    }
+    override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", lazyHeaders)
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val manga = response.parseAs<MangaDetail>()
@@ -476,39 +454,30 @@ class Koharu(
 
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
 
-    // Page List
-
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
         return client.newCall(pageListRequest(chapter))
             .asObservableSuccess()
-            .map { response ->
-                pageListParse(response)
-            }
+            .map(::pageListParse)
     }
 
-    override fun pageListRequest(chapter: SChapter): Request {
-        return POST("$apiBooksUrl/detail/${chapter.url}", lazyHeaders)
-    }
+    override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", lazyHeaders)
 
     override fun pageListParse(response: Response): List<Page> {
         val mangaData = response.parseAs<MangaData>()
         val url = response.request.url.toString()
         val matches = Regex("""/detail/(\d+)/([a-z\d]+)""").find(url)
-        if (matches == null || matches.groupValues.size < 3) return emptyList()
-        val imagesInfo = getImagesByMangaData(mangaData, matches.groupValues[1], matches.groupValues[2])
+            ?: return emptyList()
+        val (entryId, entryKey) = matches.destructured
+        val imagesInfo = getImagesByMangaData(mangaData, entryId, entryKey)
 
         return imagesInfo.first.entries.mapIndexed { index, image ->
             Page(index, imageUrl = "${imagesInfo.first.base}/${image.path}?w=${imagesInfo.second}")
         }
     }
 
-    override fun imageRequest(page: Page): Request {
-        return GET(page.imageUrl!!, lazyHeaders)
-    }
+    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, lazyHeaders)
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
-
-    // Settings
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
@@ -538,16 +507,33 @@ class Koharu(
         addRandomUAPreferenceToScreen(screen)
     }
 
-    private inline fun <reified T> Response.parseAs(): T {
-        return json.decodeFromString(body.string())
-    }
+    private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
 
     companion object {
         const val PREFIX_ID_KEY_SEARCH = "id:"
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
-
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
+    }
+}
+
+class WebViewCookieJar : okhttp3.CookieJar {
+    private val cookieManager = CookieManager.getInstance()
+
+    override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
+        val urlString = url.toString()
+        cookies.forEach { cookie ->
+            cookieManager.setCookie(urlString, cookie.toString())
+        }
+    }
+
+    override fun loadForRequest(url: okhttp3.HttpUrl): List<okhttp3.Cookie> {
+        val cookies = cookieManager.getCookie(url.toString())
+        return if (cookies != null && cookies.isNotEmpty()) {
+            cookies.split(";").mapNotNull { okhttp3.Cookie.parse(url, it.trim()) }
+        } else {
+            emptyList()
+        }
     }
 }
