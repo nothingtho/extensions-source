@@ -44,21 +44,20 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
-import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.toResponseBody
 import rx.Observable
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class Koharu(
     override val lang: String = "all",
@@ -89,8 +88,6 @@ class Koharu(
     private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
 
     private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
-
-    private var crtToken: String? = null
 
     private var _domainUrl: String? = null
     private val domainUrl: String
@@ -128,105 +125,99 @@ class Koharu(
                 customUA = preferences.getPrefCustomUA(),
                 filterInclude = listOf("chrome"),
             )
-            .addInterceptor(CrtInterceptor())
-            .addInterceptor(CloudflareInterceptor())
             .rateLimit(3)
             .build()
     }
 
-    private inner class CrtInterceptor : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            if (crtToken == null) {
-                return chain.proceed(chain.request())
-            }
+    private val clearanceClient = network.client.newBuilder()
+        .setRandomUserAgent(
+            userAgentType = preferences.getPrefUAType(),
+            customUA = preferences.getPrefCustomUA(),
+            filterInclude = listOf("chrome"),
+        )
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val clearance = getClearance()
+                ?: throw IOException("Failed to get clearance token. Open WebView and solve CAPTCHA if needed.")
 
-            val originalUrl = chain.request().url
-            if (!originalUrl.toString().startsWith(apiUrl)) {
-                return chain.proceed(chain.request())
-            }
-
-            val newUrl = originalUrl.newBuilder()
-                .addQueryParameter("crt", crtToken)
+            val newUrl = request.url.newBuilder()
+                .addQueryParameter("crt", clearance)
                 .build()
-
-            val newRequest = chain.request().newBuilder()
+            val newRequest = request.newBuilder()
                 .url(newUrl)
                 .build()
 
-            return chain.proceed(newRequest)
+            val response = chain.proceed(newRequest)
+
+            if (response.code in listOf(400, 403)) {
+                response.close()
+                _clearance = null
+                throw IOException("Token has expired. Open WebView to refresh.")
+            }
+
+            response
         }
-    }
+        .rateLimit(3)
+        .build()
 
-    private inner class CloudflareInterceptor : Interceptor {
-        private val handler = Handler(Looper.getMainLooper())
+    private val context: Application by injectLazy()
+    private val handler by lazy { Handler(Looper.getMainLooper()) }
+    private var _clearance: String? = null
 
-        @SuppressLint("SetJavaScriptEnabled")
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val originalRequest = chain.request()
-            val response = chain.proceed(originalRequest)
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun getClearance(): String? {
+        _clearance?.also { return it }
 
-            if (response.code !in listOf(503, 403)) {
-                return response
+        val latch = CountDownLatch(1)
+        var webView: WebView? = null
+
+        handler.post {
+            val wv = WebView(context)
+            webView = wv
+            wv.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                databaseEnabled = true
+                userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
             }
+            CookieManager.getInstance().setAcceptCookie(true)
 
-            val body = try { response.body.string() } catch (e: Exception) { "" }
+            wv.webViewClient = object : WebViewClient() {}
+            wv.loadUrl(domainUrl)
+        }
 
-            if (!body.contains("cf-challenge-running", true)) {
-                val newBody = body.toResponseBody(response.body.contentType())
-                return response.newBuilder().body(newBody).build()
-            }
-
-            response.close()
-
-            var webView: WebView? = null
-            val latch = CountDownLatch(1)
-
-            handler.post {
-                val wv = WebView(Injekt.get<Application>())
-                webView = wv
-                wv.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
-                }
-                CookieManager.getInstance().setAcceptCookie(true)
-
-                wv.webViewClient = object : WebViewClient() {}
-                wv.loadUrl(originalRequest.url.toString())
-            }
-
-            var resolved = false
-            for (i in 1..60) {
-                Thread.sleep(2000)
-                val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
-                if (cookies != null && "cf_clearance" in cookies) {
-                    handler.post {
-                        webView?.evaluateJavascript("window.localStorage.getItem('clearance')") {
-                            crtToken = it.takeUnless { it == "null" }?.removeSurrounding("\"")
-                            latch.countDown()
-                        }
+        var resolved = false
+        for (i in 1..60) {
+            Thread.sleep(2000)
+            val cookies = CookieManager.getInstance().getCookie(domainUrl)
+            if (cookies != null && "cf_clearance" in cookies) {
+                handler.post {
+                    webView?.evaluateJavascript("window.localStorage.getItem('clearance')") {
+                        _clearance = it.takeUnless { it == "null" }?.removeSurrounding("\"")
+                        latch.countDown()
                     }
-                    resolved = true
-                    break
                 }
+                resolved = true
+                break
             }
-
-            if (resolved) {
-                latch.await()
-            }
-
-            handler.post {
-                webView?.stopLoading()
-                webView?.destroy()
-            }
-
-            if (!resolved) {
-                throw Exception("Failed to solve Cloudflare challenge.")
-            }
-
-            return chain.proceed(originalRequest)
         }
+
+        if (resolved) {
+            latch.await(5, TimeUnit.SECONDS)
+        }
+
+        handler.post {
+            webView?.stopLoading()
+            webView?.destroy()
+        }
+
+        CookieManager.getInstance().flush()
+
+        if (!resolved) {
+            throw IOException("Failed to solve Cloudflare challenge.")
+        }
+
+        return _clearance
     }
 
     private fun getManga(book: Entry) = SManga.create().apply {
@@ -269,7 +260,7 @@ class Koharu(
             else -> "0"
         }
 
-        val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", lazyHeaders)).execute()
+        val imagesResponse = clearanceClient.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", lazyHeaders)).execute()
         val images = imagesResponse.parseAs<ImagesInfo>() to realQuality
         return images
     }
@@ -478,7 +469,7 @@ class Koharu(
     // Page List
 
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return client.newCall(pageListRequest(chapter))
+        return clearanceClient.newCall(pageListRequest(chapter))
             .asObservableSuccess()
             .map { response ->
                 pageListParse(response)
@@ -534,6 +525,7 @@ class Koharu(
                 "Excluding: ${alwaysExcludeTags()}"
         }.also(screen::addPreference)
 
+        // Add User-Agent preference
         addRandomUAPreferenceToScreen(screen)
     }
 
