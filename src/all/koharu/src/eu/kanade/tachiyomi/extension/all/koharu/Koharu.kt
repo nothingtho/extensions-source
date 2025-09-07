@@ -23,10 +23,6 @@ import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.otherList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.parodyList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetchAttempts
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetched
-import eu.kanade.tachiyomi.lib.randomua.RandomUserAgent
-import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
-import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
-import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
@@ -103,13 +99,11 @@ class Koharu(
         }
     }
 
-    private val defaultUserAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
-
     override val headers by lazy {
         headersBuilder()
             .set("Referer", "$domainUrl/")
             .set("Origin", domainUrl)
-            .set("User-Agent", defaultUserAgent)
+            .set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36")
             .build()
     }
 
@@ -120,34 +114,8 @@ class Koharu(
             .cookieJar(webViewCookieJar)
             .addInterceptor(CrtInterceptor())
             .addInterceptor(CloudflareInterceptor())
-            .addInterceptor(::userAgentInterceptor) // Add our custom UA interceptor
             .rateLimit(3)
             .build()
-    }
-
-    // This new interceptor replaces the randomua library's helper function.
-    // It will only activate if the user selects a non-default UA in settings.
-    private fun userAgentInterceptor(chain: Interceptor.Chain): Response {
-        val originalRequest = chain.request()
-
-        val uaType = preferences.getPrefUAType()
-        if (uaType.isNullOrEmpty()) { // Correct null/empty check
-            return chain.proceed(originalRequest)
-        }
-
-        val newUserAgent = when (uaType) {
-            "custom" -> preferences.getPrefCustomUA()
-            else -> RandomUserAgent.next(uaType, filterInclude = listOf("chrome"))
-        }
-
-        if (newUserAgent.isNullOrEmpty()) {
-            return chain.proceed(originalRequest)
-        }
-
-        val newRequest = originalRequest.newBuilder()
-            .header("User-Agent", newUserAgent)
-            .build()
-        return chain.proceed(newRequest)
     }
 
     private inner class CrtInterceptor : Interceptor {
@@ -504,8 +472,6 @@ class Koharu(
             summary = "Separate tags with commas (,).\n" +
                 "Excluding: ${alwaysExcludeTags()}"
         }.also(screen::addPreference)
-
-        addRandomUAPreferenceToScreen(screen)
     }
 
     private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
