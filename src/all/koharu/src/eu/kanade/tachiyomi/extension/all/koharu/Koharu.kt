@@ -107,23 +107,32 @@ class Koharu(
         headersBuilder()
             .set("Referer", "$domainUrl/")
             .set("Origin", domainUrl)
+            // Set the new default User-Agent
+            .set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36")
             .build()
     }
 
     private val webViewCookieJar = WebViewCookieJar()
 
     override val client: OkHttpClient by lazy {
-        network.client.newBuilder()
+        val builder = network.client.newBuilder()
             .cookieJar(webViewCookieJar)
-            .setRandomUserAgent(
-                userAgentType = preferences.getPrefUAType(),
+            .addInterceptor(CrtInterceptor())
+            .addInterceptor(CloudflareInterceptor()) // Keep your custom interceptor
+            .rateLimit(3)
+
+        // Check user preferences. Only use Random UA if the user has selected something.
+        val uaType = preferences.getPrefUAType()
+        if (uaType.isNotEmpty()) {
+            builder.setRandomUserAgent(
+                userAgentType = uaType,
                 customUA = preferences.getPrefCustomUA(),
                 filterInclude = listOf("chrome"),
+                cloudflareBypass = false, // Disable the library's Cloudflare bypass
             )
-            .addInterceptor(CrtInterceptor())
-            .addInterceptor(CloudflareInterceptor())
-            .rateLimit(3)
-            .build()
+        }
+
+        builder.build()
     }
 
     private inner class CrtInterceptor : Interceptor {
@@ -147,6 +156,7 @@ class Koharu(
         }
     }
 
+    // Keep this custom interceptor as it is the one that works for the site.
     private inner class CloudflareInterceptor : Interceptor {
         private val handler = Handler(Looper.getMainLooper())
 
