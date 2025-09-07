@@ -157,7 +157,7 @@ class Koharu(
             val response = chain.proceed(originalRequest)
 
             // Check if Cloudflare protection is active
-            if (response.code !in listOf(503, 403) || !response.header("Server", "").equals("cloudflare", true)) {
+            if (response.code !in listOf(503, 403) || response.header("Server")?.equals("cloudflare", true) != true) {
                 return response
             }
 
@@ -193,7 +193,9 @@ class Koharu(
                 }
 
                 // Wait for the WebView to solve the challenge
-                latch.await(60, TimeUnit.SECONDS)
+                if (!latch.await(60, TimeUnit.SECONDS)) {
+                    throw IOException("WebView timed out.")
+                }
 
                 handler.post {
                     webView?.stopLoading()
@@ -417,10 +419,10 @@ class Koharu(
     }
 
     // FIX for 'overrides nothing' compilation error
-    override fun fetchSimilarManga(manga: SManga): Observable<MangasPage> {
+    override fun similarMangaParse(response: Response): MangasPage {
         // The API doesn't provide a list of related manga.
         // Return an empty page to prevent the app from crashing.
-        return Observable.just(MangasPage(emptyList(), false))
+        return MangasPage(emptyList(), false)
     }
 
     override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
