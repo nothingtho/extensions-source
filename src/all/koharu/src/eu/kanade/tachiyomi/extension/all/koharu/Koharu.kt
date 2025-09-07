@@ -1,13 +1,7 @@
 package eu.kanade.tachiyomi.extension.all.koharu
 
-import android.annotation.SuppressLint
 import android.app.Application
 import android.content.SharedPreferences
-import android.os.Handler
-import android.os.Looper
-import android.webkit.CookieManager
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -27,6 +21,7 @@ import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
+import eu.kanade.tachiyomi.network.interceptor.WebViewInterceptor // Import the correct interceptor
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -43,7 +38,6 @@ import kotlinx.serialization.json.Json
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -51,11 +45,8 @@ import rx.Observable
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
-import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 class Koharu(
     override val lang: String = "all",
@@ -78,9 +69,7 @@ class Koharu(
     private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
     private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
 
-    private var crtToken: String? = null
     private var _domainUrl: String? = null
-
     private val domainUrl: String
         get() = _domainUrl ?: run {
             val domain = getDomain()
@@ -91,7 +80,7 @@ class Koharu(
     private fun getDomain(): String {
         try {
             val noRedirectClient = network.client.newBuilder().followRedirects(false).build()
-            val host = noRedirectClient.newCall(GET(baseUrl, headers)).execute()
+            val host = noRedirectClient.newCall(GET(baseUrl)).execute()
                 .headers["Location"]?.toHttpUrlOrNull()?.host
                 ?: return baseUrl
             return "https://$host"
@@ -107,95 +96,19 @@ class Koharu(
             .build()
     }
 
-    private val webViewCookieJar = WebViewCookieJar()
+    private val webViewInterceptor by lazy {
+        WebViewInterceptor(
+            Injekt.get<Application>(),
+            { it.header("Server").equals("cloudflare", ignoreCase = true) },
+            { it.body?.string()?.contains("Verify you are human") == true },
+        )
+    }
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
-            .cookieJar(webViewCookieJar)
-            .addInterceptor(CrtInterceptor())
-            .addInterceptor(CloudflareInterceptor())
+            .addInterceptor(webViewInterceptor)
             .rateLimit(3)
             .build()
-    }
-
-    private inner class CrtInterceptor : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val token = crtToken ?: return chain.proceed(chain.request())
-
-            val originalUrl = chain.request().url
-            if (!originalUrl.toString().startsWith(apiUrl)) {
-                return chain.proceed(chain.request())
-            }
-
-            val newUrl = originalUrl.newBuilder()
-                .addQueryParameter("crt", token)
-                .build()
-
-            val newRequest = chain.request().newBuilder()
-                .url(newUrl)
-                .build()
-
-            return chain.proceed(newRequest)
-        }
-    }
-
-    private inner class CloudflareInterceptor : Interceptor {
-        private val handler = Handler(Looper.getMainLooper())
-
-        @SuppressLint("SetJavaScriptEnabled")
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val originalRequest = chain.request()
-            val response = chain.proceed(originalRequest)
-
-            if (response.code !in listOf(503, 403) || response.header("Server")?.equals("cloudflare", true) != true) {
-                return response
-            }
-
-            response.close()
-            try {
-                var webView: WebView? = null
-                val latch = CountDownLatch(1)
-
-                handler.post {
-                    val wv = WebView(Injekt.get<Application>())
-                    webView = wv
-                    wv.settings.apply {
-                        javaScriptEnabled = true
-                        domStorageEnabled = true
-                        databaseEnabled = true
-                        userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
-                    }
-                    CookieManager.getInstance().setAcceptCookie(true)
-
-                    wv.webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView?, url: String?) {
-                            val cookies = CookieManager.getInstance().getCookie(url)
-                            if (cookies != null && "cf_clearance" in cookies) {
-                                val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
-                                if (clearanceCookie != null) {
-                                    crtToken = clearanceCookie.substringAfter("=").trim()
-                                    latch.countDown()
-                                }
-                            }
-                        }
-                    }
-                    wv.loadUrl(originalRequest.url.toString())
-                }
-
-                if (!latch.await(60, TimeUnit.SECONDS)) {
-                    throw IOException("WebView timed out.")
-                }
-
-                handler.post {
-                    webView?.stopLoading()
-                    webView?.destroy()
-                }
-            } catch (e: Exception) {
-                throw IOException("Failed to solve Cloudflare challenge. ${e.message}")
-            }
-
-            return chain.proceed(originalRequest)
-        }
     }
 
     private fun getManga(book: Entry) = SManga.create().apply {
@@ -482,25 +395,5 @@ class Koharu(
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
-    }
-}
-
-class WebViewCookieJar : okhttp3.CookieJar {
-    private val cookieManager = CookieManager.getInstance()
-
-    override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
-        val urlString = url.toString()
-        cookies.forEach { cookie ->
-            cookieManager.setCookie(urlString, cookie.toString())
-        }
-    }
-
-    override fun loadForRequest(url: okhttp3.HttpUrl): List<okhttp3.Cookie> {
-        val cookies = cookieManager.getCookie(url.toString())
-        return if (cookies != null && cookies.isNotEmpty()) {
-            cookies.split(";").mapNotNull { okhttp3.Cookie.parse(url, it.trim()) }
-        } else {
-            emptyList()
-        }
     }
 }
