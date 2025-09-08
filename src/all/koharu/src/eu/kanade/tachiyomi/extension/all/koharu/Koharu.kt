@@ -149,12 +149,7 @@ class Koharu(
             val originalRequest = chain.request()
             val response = chain.proceed(originalRequest)
 
-            if (response.code !in listOf(503, 403) || response.header("Server", "")?.startsWith("cloudflare", true) != true) {
-                return response
-            }
-
-            val body = try { response.peekBody(Long.MAX_VALUE).string() } catch (e: Exception) { "" }
-            if (!body.contains("cf-challenge-running", true)) {
+            if (response.code !in listOf(503, 403) || !response.header("Server", "").startsWith("cloudflare", true)) {
                 return response
             }
 
@@ -162,7 +157,6 @@ class Koharu(
             try {
                 var webView: WebView? = null
                 val latch = CountDownLatch(1)
-                var resolved = false
 
                 handler.post {
                     val wv = WebView(Injekt.get<Application>())
@@ -171,45 +165,34 @@ class Koharu(
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         databaseEnabled = true
-                        // FIX: Use Elvis operator to provide a fallback UA and fix build error
                         userAgentString = originalRequest.header("User-Agent")
-                            ?: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+                            ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
                     }
                     CookieManager.getInstance().setAcceptCookie(true)
 
-                    wv.webViewClient = object : WebViewClient() {}
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            val cookies = CookieManager.getInstance().getCookie(url)
+                            if (cookies != null && "cf_clearance" in cookies) {
+                                val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
+                                if (clearanceCookie != null) {
+                                    val token = clearanceCookie.substringAfter("=").trim()
+                                    preferences.edit().putString(PREF_CF_TOKEN, token).commit()
+                                    latch.countDown()
+                                }
+                            }
+                        }
+                    }
                     wv.loadUrl(originalRequest.url.toString())
                 }
 
-                // Polling for the cookie
-                for (i in 1..30) {
-                    Thread.sleep(1000)
-                    val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
-                    if (cookies != null && "cf_clearance" in cookies) {
-                        val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
-                        if (clearanceCookie != null) {
-                            val token = clearanceCookie.substringAfter("=").trim()
-                            preferences.edit().putString(PREF_CF_TOKEN, token).commit()
-                            resolved = true
-                            latch.countDown()
-                            break
-                        }
-                    }
+                if (!latch.await(60, TimeUnit.SECONDS)) {
+                    throw IOException("WebView timed out.")
                 }
-
-                if (!resolved) {
-                    latch.countDown()
-                }
-
-                latch.await(5, TimeUnit.SECONDS)
 
                 handler.post {
                     webView?.stopLoading()
                     webView?.destroy()
-                }
-
-                if (!resolved) {
-                    throw IOException("Failed to solve Cloudflare challenge: cf_clearance cookie not found.")
                 }
             } catch (e: Exception) {
                 throw IOException("Failed to solve Cloudflare challenge. ${e.message}")
