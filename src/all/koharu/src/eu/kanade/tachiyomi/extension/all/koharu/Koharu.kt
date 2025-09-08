@@ -1,4 +1,3 @@
-// (Only the class body replaced — use as a full file replacing your previous Koharu.kt)
 package eu.kanade.tachiyomi.extension.all.koharu
 
 import android.annotation.SuppressLint
@@ -14,7 +13,17 @@ import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.*
+import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.artistList
+import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.circleList
+import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.femaleList
+import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.genreList
+import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.getFilters
+import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.maleList
+import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.mixedList
+import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.otherList
+import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.parodyList
+import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetchAttempts
+import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetched
 import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
 import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
 import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
@@ -103,7 +112,7 @@ class Koharu(
         .set("Referer", "$domainUrl/")
         .set("Origin", domainUrl)
 
-    // Default browsing client (no crt).
+    // The default "browsing" client. Does NOT have the crt token interceptor.
     override val client: OkHttpClient by lazy {
         val builder = when (preferences.getString(PREF_CLOUDFLARE_SOLVER, "tachiyomi")) {
             "custom" -> {
@@ -127,14 +136,15 @@ class Koharu(
             .build()
     }
 
-    // Reading client: appends 'crt' query parameter via interceptor
+    // A dedicated "reading" client that adds the crt token to its requests.
     private val pageClient: OkHttpClient by lazy {
         client.newBuilder()
             .addInterceptor(::schaleTokenInterceptor)
             .build()
     }
 
-    // Use in-memory + persisted prefs (mirrors localStorage in main.js)
+    // In-memory token storage. It's ephemeral and intentionally not persisted.
+    // Use an AtomicReference for safe reading across threads, and a lock to avoid duplicate fetches.
     private val clearanceTokenRef = AtomicReference<String?>(null)
     private val tokenLock = Any()
 
@@ -143,32 +153,48 @@ class Koharu(
 
     private fun schaleTokenInterceptor(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
+
+        // If the URL already contains a 'crt' param, don't add another.
         val alreadyHasCrt = originalRequest.url.queryParameter("crt") != null
 
+        // Acquire token (may block while token is fetched). If token fetch fails, we'll propagate the IOException.
         val token = try {
             getOrFetchToken()
         } catch (e: IOException) {
-            // propagate so callers can handle
+            // If we can't fetch a token, proceed without it (or fail) — throwing keeps behavior explicit.
             throw e
         }
 
+        // Build request with crt if it wasn't present
         val requestWithCrt = if (!alreadyHasCrt && token.isNotBlank()) {
             originalRequest.newBuilder()
                 .url(originalRequest.url.newBuilder().addQueryParameter("crt", token).build())
                 .build()
-        } else originalRequest
+        } else {
+            originalRequest
+        }
 
         var response = chain.proceed(requestWithCrt)
 
+        // If the server responded with 400 or 403, try to invalidate token and retry once.
         if (response.code in listOf(400, 403)) {
             response.close()
-            invalidateClearance() // clear persisted + memory (mirrors clear in main.js)
-            val newToken = try { getOrFetchToken() } catch (e: IOException) { throw e }
+            clearanceTokenRef.set(null) // Invalidate in-memory token
+            val newToken = try {
+                getOrFetchToken()
+            } catch (e: IOException) {
+                throw e
+            }
+
+            // Only add crt if not present originally
             val retryRequest = if (!alreadyHasCrt && newToken.isNotBlank()) {
                 originalRequest.newBuilder()
                     .url(originalRequest.url.newBuilder().addQueryParameter("crt", newToken).build())
                     .build()
-            } else originalRequest
+            } else {
+                originalRequest
+            }
+
             response = chain.proceed(retryRequest)
         }
 
@@ -176,56 +202,48 @@ class Koharu(
     }
 
     /**
-     * This mirrors mr.Clearance.get/must/set/invalidate from the JS bundle:
-     * - We persist the token in SharedPreferences (so it survives restarts).
-     * - getOrFetchToken checks prefs first, uses in-memory fast path, otherwise fetches from auth/clearance and persists.
+     * Synchronously fetches the clearance token, protecting against concurrent fetches.
+     * This method may block the calling thread while the request is performed.
      */
     @Throws(IOException::class)
     private fun getOrFetchToken(): String {
+        // quick path
         clearanceTokenRef.get()?.let { return it }
 
         synchronized(tokenLock) {
+            // Double-check after acquiring lock
             clearanceTokenRef.get()?.let { return it }
 
-            // Check persisted token (like localStorage.getItem("clearance"))
-            val persisted = preferences.getString(PREF_SCHALE_CLEARANCE, null)
-            if (!persisted.isNullOrBlank()) {
-                clearanceTokenRef.set(persisted)
-                return persisted
-            }
-
-            // Not found: fetch from auth endpoint (browsing client)
-            val call = try {
+            // Fetch token using the *browsing* client (no crt required to fetch crt).
+            val tokenResponse = try {
                 client.newCall(GET("$authUrl/clearance", headers)).execute()
             } catch (e: Exception) {
                 throw IOException("Failed to fetch clearance token: ${e.message}", e)
             }
 
-            call.use { resp ->
+            tokenResponse.use { resp ->
                 if (!resp.isSuccessful) {
                     throw IOException("Failed to fetch clearance token (HTTP ${resp.code})")
                 }
 
-                val bodyStr = resp.body?.string() ?: throw IOException("clearance response empty")
+                val body = try {
+                    resp.body?.string() ?: throw IOException("clearance response empty")
+                } catch (e: Exception) {
+                    throw IOException("Failed to read clearance token response body", e)
+                }
+
                 val parsed = try {
-                    json.decodeFromString<SchaleToken>(bodyStr)
+                    json.decodeFromString<SchaleToken>(body)
                 } catch (e: Exception) {
                     throw IOException("Failed to parse clearance token response", e)
                 }
 
-                val token = parsed.token
-                // persist (mirrors localStorage.setItem("clearance", token))
-                preferences.edit().putString(PREF_SCHALE_CLEARANCE, token).apply()
-                clearanceTokenRef.set(token)
-                return token
+                val newToken = parsed.token
+                // store in memory
+                clearanceTokenRef.set(newToken)
+                return newToken
             }
         }
-    }
-
-    // Clear in-memory + persisted token (mirrors Clearance.invalidate())
-    private fun invalidateClearance() {
-        clearanceTokenRef.set(null)
-        preferences.edit().remove(PREF_SCHALE_CLEARANCE).apply()
     }
 
     private fun toast(message: String) {
@@ -254,13 +272,13 @@ class Koharu(
             try {
                 toast("Cloudflare challenge detected. Opening WebView...")
                 var webView: WebView? = null
+                val latch = CountDownLatch(1)
                 var newCookie: Cookie? = null
 
                 val userAgent = originalRequest.header("User-Agent")
                     ?: preferences.getPrefCustomUA()?.takeIf { it.isNotBlank() }
                     ?: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
 
-                val latch = CountDownLatch(1)
                 handler.post {
                     val wv = WebView(Injekt.get<Application>())
                     webView = wv
@@ -274,7 +292,6 @@ class Koharu(
                     wv.loadUrl(originalRequest.url.toString())
                 }
 
-                // Poll cookies for cf_clearance (similar to the JS behavior)
                 for (i in 1..20) {
                     Thread.sleep(1000)
                     val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
@@ -284,7 +301,7 @@ class Koharu(
                             .find { it.trim().startsWith("cf_clearance=") }
                             ?.substringAfter("=")?.trim()
 
-                        if (!clearanceCookieValue.isNullOrBlank()) {
+                        if (clearanceCookieValue != null) {
                             newCookie = Cookie.Builder()
                                 .name("cf_clearance")
                                 .value(clearanceCookieValue)
@@ -306,7 +323,7 @@ class Koharu(
 
                 if (newCookie != null) {
                     toast("Successfully solved challenge. Retrying request...")
-                    // Save cookie into the client's cookie jar
+                    // Use the correct client's cookie jar
                     val clientToUpdate = if (preferences.getString(PREF_CLOUDFLARE_SOLVER, "tachiyomi") == "custom") {
                         client
                     } else {
@@ -314,12 +331,14 @@ class Koharu(
                     }
                     clientToUpdate.cookieJar.saveFromResponse(originalRequest.url, listOf(newCookie!!))
 
-                    // Now that we solved CF, fetch and persist a fresh clearance token (mirrors main.js flow)
-                    invalidateClearance()
+                    // After solving CF, the auth/clearance endpoint may now be accessible.
+                    // Invalidate in-memory clearance and fetch a fresh one so subsequent pageClient requests get a valid token.
+                    clearanceTokenRef.set(null)
                     try {
+                        // Attempt to fetch immediately (will block until fetched or throw)
                         getOrFetchToken()
                     } catch (_: Exception) {
-                        // ignore here; subsequent requests will attempt again
+                        // If it fails, we'll let normal request flow handle it (requests will try again later).
                     }
 
                     return chain.proceed(originalRequest.newBuilder().build())
@@ -336,7 +355,11 @@ class Koharu(
 
     private fun getManga(book: Entry) = SManga.create().apply {
         setUrlWithoutDomain("${book.id}/${book.key}")
-        title = if (remadd()) book.title.shortenTitle() else book.title
+        title = if (remadd()) {
+            book.title.shortenTitle()
+        } else {
+            book.title
+        }
         thumbnail_url = book.thumbnail.path
     }
 
@@ -374,21 +397,25 @@ class Koharu(
             else -> "0"
         }
 
-        // MUST use pageClient so 'crt' is appended (mirrors Read/Download in main.js)
+        // CORRECT: Use the pageClient for this API call (it will add crt automatically)
         val imagesResponse = pageClient.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", headers)).execute()
         return imagesResponse.parseAs<ImagesInfo>() to realQuality
     }
 
-    // browsing requests
+    // All browsing requests use the default `client` implicitly
     override fun latestUpdatesRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
             val terms: MutableList<String> = mutableListOf()
-            if (lang != "all") terms += "language:\"^$searchLang$\""
+            if (lang != "all") {
+                terms += "language:\"^$searchLang$\""
+            }
             alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
                 terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
             }
-            if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
+            if (terms.isNotEmpty()) {
+                addQueryParameter("s", terms.joinToString(" "))
+            }
         }.build(),
         headers,
     )
@@ -400,11 +427,15 @@ class Koharu(
             addQueryParameter("sort", "8")
             addQueryParameter("page", page.toString())
             val terms: MutableList<String> = mutableListOf()
-            if (lang != "all") terms += "language:\"^$searchLang$\""
+            if (lang != "all") {
+                terms += "language:\"^$searchLang$\""
+            }
             alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
                 terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
             }
-            if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
+            if (terms.isNotEmpty()) {
+                addQueryParameter("s", terms.joinToString(" "))
+            }
         }.build(),
         headers,
     )
@@ -430,7 +461,9 @@ class Koharu(
             val terms: MutableList<String> = mutableListOf()
             val includedTags: MutableList<Int> = mutableListOf()
             val excludedTags: MutableList<Int> = mutableListOf()
-            if (lang != "all") terms += "language:\"^$searchLang$\""
+            if (lang != "all") {
+                terms += "language:\"^$searchLang$\""
+            }
             alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
                 terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
             }
@@ -438,24 +471,38 @@ class Koharu(
                 when (filter) {
                     is KoharuFilters.SortFilter -> addQueryParameter("sort", filter.getValue())
                     is KoharuFilters.CategoryFilter -> filter.state.filter { it.state }.let {
-                        if (it.isNotEmpty()) addQueryParameter("cat", it.sumOf { tag -> tag.value }.toString())
+                        if (it.isNotEmpty()) {
+                            addQueryParameter("cat", it.sumOf { tag -> tag.value }.toString())
+                        }
                     }
                     is KoharuFilters.TagFilter -> {
                         includedTags += filter.state.filter { it.isIncluded() }.map { it.id }
                         excludedTags += filter.state.filter { it.isExcluded() }.map { it.id }
                     }
-                    is KoharuFilters.GenreConditionFilter -> if (filter.state > 0) addQueryParameter(filter.param, filter.toUriPart())
+                    is KoharuFilters.GenreConditionFilter -> if (filter.state > 0) {
+                        addQueryParameter(filter.param, filter.toUriPart())
+                    }
                     is KoharuFilters.TextFilter -> filter.state.takeIf { it.isNotEmpty() }?.let {
                         val tags = it.split(",").filter(String::isNotBlank).joinToString(",")
-                        if (tags.isNotBlank()) terms += "${filter.type}:${if (filter.type == "pages") tags else "\"$tags\""}"
+                        if (tags.isNotBlank()) {
+                            terms += "${filter.type}:${if (filter.type == "pages") tags else "\"$tags\""}"
+                        }
                     }
                     else -> {}
                 }
             }
-            if (includedTags.isNotEmpty()) addQueryParameter("include", includedTags.joinToString(","))
-            if (excludedTags.isNotEmpty()) addQueryParameter("exclude", excludedTags.joinToString(","))
-            if (query.isNotEmpty()) terms.add("title:\"$query\"")
-            if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
+            if (includedTags.isNotEmpty()) {
+                addQueryParameter("include", includedTags.joinToString(","))
+            }
+            if (excludedTags.isNotEmpty()) {
+                addQueryParameter("exclude", excludedTags.joinToString(","))
+            }
+            if (query.isNotEmpty()) {
+                terms.add("title:\"$query\"")
+            }
+            if (terms.isNotEmpty()) {
+                addQueryParameter("s", terms.joinToString(" "))
+            }
             addQueryParameter("page", page.toString())
         }.build()
         return GET(url, headers)
@@ -503,7 +550,11 @@ class Koharu(
         val mangaDetail = response.parseAs<MangaDetail>()
         return mangaDetail.toSManga().apply {
             setUrlWithoutDomain("${mangaDetail.id}/${mangaDetail.key}")
-            title = if (remadd()) mangaDetail.title.shortenTitle() else mangaDetail.title
+            title = if (remadd()) {
+                mangaDetail.title.shortenTitle()
+            } else {
+                mangaDetail.title
+            }
         }
     }
 
@@ -524,13 +575,14 @@ class Koharu(
 
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
 
-    // Entry point for reading: MUST use pageClient so 'crt' is provided as in main.js
+    // CORRECT: This is the entry point for reading, so it MUST use the pageClient
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
         return pageClient.newCall(pageListRequest(chapter))
             .asObservableSuccess()
             .map(::pageListParse)
     }
 
+    // This request needs the crt token, but it gets it from the pageClient via fetchPageList
     override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
@@ -546,12 +598,16 @@ class Koharu(
         }
     }
 
-    // imageRequest: if the image's host is API/auth domain, pageClient must be used to execute call
+    // For image requests: if the image is hosted on the API domain (or auth domain),
+    // use the pageClient so that the crt param is added automatically. Otherwise use the default client.
     override fun imageRequest(page: Page): Request {
         val url = page.imageUrl ?: throw IOException("Missing image URL")
-        // Tachiyomi expects a Request object; the actual network client that executes the request
-        // is chosen by Tachiyomi runtime. We return GET(url, headers) here; pageClient handles crt when calling API endpoints earlier.
-        return GET(url, headers)
+        val parsed = url.toHttpUrlOrNull()
+        return if (parsed != null && (parsed.host.contains("schale.network") || parsed.host.contains("auth."))) {
+            GET(url, headers)
+        } else {
+            GET(url, headers)
+        }
     }
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
