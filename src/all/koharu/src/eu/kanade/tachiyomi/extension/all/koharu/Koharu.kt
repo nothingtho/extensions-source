@@ -77,7 +77,7 @@ class Koharu(
 
     private val json: Json by injectLazy()
     private val preferences: SharedPreferences by getPreferencesLazy()
-    private val handler by lazy { Handler(Looper.getMainLooper()) } // ADDED
+    private val handler by lazy { Handler(Looper.getMainLooper()) }
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
@@ -109,7 +109,6 @@ class Koharu(
         .set("Referer", "$domainUrl/")
         .set("Origin", domainUrl)
 
-    // CHANGED: Client builder now selects solver based on preference
     override val client: OkHttpClient by lazy {
         val builder = when (preferences.getString(PREF_CLOUDFLARE_SOLVER, "tachiyomi")) {
             "custom" -> {
@@ -130,10 +129,9 @@ class Koharu(
                 customUA = preferences.getPrefCustomUA(),
                 filterInclude = listOf("chrome"),
             )
-            // Replaced CrtInterceptor with a cleaner lambda interceptor
             .addInterceptor { chain ->
                 val originalRequest = chain.request()
-                val token = preferences.getString(PREF_CF_TOKEN, null)
+                val token = preferences.getString(PREF_SCHALE_TOKEN, null)
 
                 if (token == null || !originalRequest.url.toString().startsWith(apiUrl)) {
                     return@addInterceptor chain.proceed(originalRequest)
@@ -153,16 +151,12 @@ class Koharu(
             .build()
     }
 
-    // ADDED: Helper function for toasts
     private fun toast(message: String) {
         handler.post {
             Toast.makeText(Injekt.get<Application>(), message, Toast.LENGTH_LONG).show()
         }
     }
 
-    // REMOVED: CrtInterceptor is no longer needed
-
-    // CHANGED: CloudflareInterceptor is now fixed and has debug toasts
     private inner class CloudflareInterceptor : Interceptor {
         @SuppressLint("SetJavaScriptEnabled", "ApplySharedPref")
         override fun intercept(chain: Interceptor.Chain): Response {
@@ -189,7 +183,7 @@ class Koharu(
                 var newCookie: Cookie? = null
 
                 val userAgent = originalRequest.header("User-Agent")
-                    ?: preferences.getPrefCustomUA().takeIf { it.isNotBlank() }
+                    ?: preferences.getPrefCustomUA()?.takeIf { it.isNotBlank() }
                     ?: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
 
                 handler.post {
@@ -503,7 +497,6 @@ class Koharu(
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        // ADDED: Preference to select the Cloudflare solver
         ListPreference(screen.context).apply {
             key = PREF_CLOUDFLARE_SOLVER
             title = "Cloudflare Solver"
@@ -544,11 +537,11 @@ class Koharu(
 
     companion object {
         const val PREFIX_ID_KEY_SEARCH = "id:"
-        private const val PREF_CLOUDFLARE_SOLVER = "pref_cloudflare_solver" // ADDED
+        private const val PREF_CLOUDFLARE_SOLVER = "pref_cloudflare_solver"
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
-        private const val PREF_CF_TOKEN = "pref_schale_token" // Renamed to avoid confusion
+        private const val PREF_SCHALE_TOKEN = "pref_schale_token"
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
     }
 }
