@@ -48,8 +48,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -143,13 +141,12 @@ class Koharu(
         override fun intercept(chain: Interceptor.Chain): Response {
             val request = chain.request()
 
-            // Proactively check for the token from the WebView's cookie jar BEFORE the request
             val cookies = webViewCookieJar.loadForRequest(baseUrl.toHttpUrl())
             cookies.firstOrNull { it.name == "cf_clearance" }?.let { cookie ->
                 val oldToken = preferences.getString(PREF_CF_TOKEN, null)
-                // If the token is new, save it and notify the user
                 if (cookie.value != oldToken) {
-                    preferences.edit().putString(PREF_CF_TOKEN, cookie.value).apply()
+                    // Use commit() to save synchronously, preventing a race condition
+                    preferences.edit().putString(PREF_CF_TOKEN, cookie.value).commit()
                     handler.post {
                         Toast.makeText(application, "Cloudflare token scraped successfully.", Toast.LENGTH_LONG).show()
                     }
@@ -158,7 +155,6 @@ class Koharu(
 
             val response = chain.proceed(request)
 
-            // If the request fails with a Cloudflare error, trigger the WebView flow
             if (response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true) {
                 response.close()
                 throw IOException("Cloudflare challenge required. Please open in WebView, solve the captcha, and then retry.")
