@@ -29,6 +29,7 @@ import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
 import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
 import eu.kanade.tachiyomi.lib.randomua.setRandomUserAgent
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -135,7 +136,9 @@ class Koharu(
             .build()
     }
 
-    // ADDED: Data class for parsing the token response
+    // ADDED: A variable to hold the token in memory for the current session
+    private var clearanceToken: String? = null
+
     @Serializable
     private data class SchaleToken(val token: String)
 
@@ -160,10 +163,10 @@ class Koharu(
 
         val response = chain.proceed(newRequest)
 
-        // If the token is rejected, clear it and retry the request once.
+        // If the token is rejected, invalidate it and retry the request once.
         if (response.code in listOf(400, 403)) {
             response.close()
-            clearToken()
+            clearanceToken = null // Invalidate the in-memory token
             val newToken = getOrFetchToken()
             val retryRequest = originalRequest.newBuilder()
                 .url(
@@ -178,28 +181,22 @@ class Koharu(
         return response
     }
 
-    // ADDED: Helper functions to manage the token
+    // ADDED: Helper functions to manage the ephemeral token
     private fun getOrFetchToken(): String {
-        val storedToken = preferences.getString(PREF_SCHALE_TOKEN, null)
-        if (storedToken != null) {
-            return storedToken
-        }
+        // If we have a token in memory, use it.
+        clearanceToken?.let { return it }
 
-        // Use a client that can bypass Cloudflare to fetch the token
+        // Otherwise, fetch a new one.
         val tokenClient = network.cloudflareClient
         val tokenResponse = tokenClient.newCall(GET("$authUrl/clearance", headers)).execute()
 
         if (!tokenResponse.isSuccessful) {
-            throw IOException("Failed to fetch Schale token (HTTP ${tokenResponse.code})")
+            throw IOException("Failed to fetch clearance token (HTTP ${tokenResponse.code})")
         }
 
         val newToken = tokenResponse.parseAs<SchaleToken>().token
-        preferences.edit().putString(PREF_SCHALE_TOKEN, newToken).apply()
+        clearanceToken = newToken
         return newToken
-    }
-
-    private fun clearToken() {
-        preferences.edit().remove(PREF_SCHALE_TOKEN).apply()
     }
 
     private fun toast(message: String) {
@@ -394,7 +391,7 @@ class Koharu(
                 when (filter) {
                     is KoharuFilters.SortFilter -> addQueryParameter("sort", filter.getValue())
                     is KoharuFilters.CategoryFilter -> filter.state.filter { it.state }.let {
-                        if (it.isNotEmpty()) addQueryParameter("cat", it.sumOf { it.value }.toString())
+                        if (it.isNotEmpty()) addQueryParameter("cat", it.sumOf { tag -> tag.value }.toString())
                     }
                     is KoharuFilters.TagFilter -> {
                         includedTags += filter.state.filter { it.isIncluded() }.map { it.id }
@@ -486,7 +483,8 @@ class Koharu(
             .map(::pageListParse)
     }
 
-    override fun pageListRequest(chapter: SChapter): Request = GET("$apiBooksUrl/detail/${chapter.url}", headers)
+    // CORRECTED: This must be a POST request, as confirmed by the site's own JavaScript
+    override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
         val mangaData = response.parseAs<MangaData>()
@@ -550,7 +548,7 @@ class Koharu(
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
-        private const val PREF_SCHALE_TOKEN = "pref_schale_token"
+        // REMOVED PREF_SCHALE_TOKEN as we are now storing the token in-memory
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
     }
 }
