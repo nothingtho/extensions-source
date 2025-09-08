@@ -1,6 +1,14 @@
 package eu.kanade.tachiyomi.extension.all.koharu
 
+import android.annotation.SuppressLint
+import android.app.Application
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
+import android.webkit.CookieManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -16,6 +24,10 @@ import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.otherList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.parodyList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetchAttempts
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetched
+import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
+import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
+import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
+import eu.kanade.tachiyomi.lib.randomua.setRandomUserAgent
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
@@ -33,6 +45,8 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.Cookie
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
@@ -40,10 +54,14 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class Koharu(
     override val lang: String = "all",
@@ -53,15 +71,14 @@ class Koharu(
     override val name = "Niyaniya"
     override val baseUrl = "https://niyaniya.moe"
     override val id = if (lang == "en") 1484902275639232927 else super.id
-
     private val apiUrl = "https://api.schale.network"
-    private val authUrl = "https://auth.schale.network"
+    private val authUrl = "https://auth.schale.network" // ADDED
     private val apiBooksUrl = "$apiUrl/books"
-
     override val supportsLatest = true
 
     private val json: Json by injectLazy()
     private val preferences: SharedPreferences by getPreferencesLazy()
+    private val handler by lazy { Handler(Looper.getMainLooper()) }
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
@@ -69,33 +86,64 @@ class Koharu(
     private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
     private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
 
-    private val domainUrl by lazy { getDomain() }
+    private var _domainUrl: String? = null
+    private val domainUrl: String
+        get() = _domainUrl ?: run {
+            val domain = getDomain()
+            _domainUrl = domain
+            domain
+        }
 
     private fun getDomain(): String {
-        return try {
-            val response = network.client.newCall(GET(baseUrl, headers)).execute()
-            response.request.url.host
-        } catch (e: Exception) {
-            baseUrl.toHttpUrl().host
+        try {
+            val noRedirectClient = network.client.newBuilder().followRedirects(false).build()
+            val host = noRedirectClient.newCall(GET(baseUrl, Headers.Builder().build())).execute()
+                .headers["Location"]?.toHttpUrlOrNull()?.host
+                ?: return baseUrl
+            return "https://$host"
+        } catch (_: Exception) {
+            return baseUrl
         }
     }
 
-    override fun headersBuilder() = super.headersBuilder()
-        .set("Referer", "https://$domainUrl/")
-        .set("Origin", "https://$domainUrl")
+    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
+        .set("Referer", "$domainUrl/")
+        .set("Origin", domainUrl)
 
-    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .addInterceptor(::schaleTokenInterceptor)
-        .rateLimit(3)
-        .build()
+    // MODIFIED: Replaced the old interceptor with the new, functional one
+    override val client: OkHttpClient by lazy {
+        val builder = when (preferences.getString(PREF_CLOUDFLARE_SOLVER, "tachiyomi")) {
+            "custom" -> {
+                toast("Using Custom WebView Solver")
+                network.client.newBuilder()
+                    .addInterceptor(CloudflareInterceptor())
+            }
+            else -> {
+                toast("Using Tachiyomi's Solver")
+                network.cloudflareClient.newBuilder()
+            }
+        }
 
+        builder
+            .setRandomUserAgent(
+                userAgentType = preferences.getPrefUAType(),
+                customUA = preferences.getPrefCustomUA(),
+                filterInclude = listOf("chrome"),
+            )
+            .addInterceptor(::schaleTokenInterceptor) // REPLACED old lambda with this
+            .rateLimit(3)
+            .build()
+    }
+
+    // ADDED: Data class for parsing the token response
     @Serializable
     private data class SchaleToken(val token: String)
 
+    // ADDED: The new, self-healing interceptor
     private fun schaleTokenInterceptor(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
 
-        // Pass through non-API requests (e.g., the token request itself)
+        // Pass through non-API requests
         if (!originalRequest.url.host.startsWith("api.")) {
             return chain.proceed(originalRequest)
         }
@@ -130,13 +178,14 @@ class Koharu(
         return response
     }
 
+    // ADDED: Helper functions to manage the token
     private fun getOrFetchToken(): String {
         val storedToken = preferences.getString(PREF_SCHALE_TOKEN, null)
         if (storedToken != null) {
             return storedToken
         }
 
-        // Use a temporary client to fetch the token to avoid interceptor loops
+        // Use a client that can bypass Cloudflare to fetch the token
         val tokenClient = network.cloudflareClient
         val tokenResponse = tokenClient.newCall(GET("$authUrl/clearance", headers)).execute()
 
@@ -151,6 +200,96 @@ class Koharu(
 
     private fun clearToken() {
         preferences.edit().remove(PREF_SCHALE_TOKEN).apply()
+    }
+
+    private fun toast(message: String) {
+        handler.post {
+            Toast.makeText(Injekt.get<Application>(), message, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private inner class CloudflareInterceptor : Interceptor {
+        @SuppressLint("SetJavaScriptEnabled", "ApplySharedPref")
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val originalRequest = chain.request()
+            val response = chain.proceed(originalRequest)
+
+            if (response.code !in listOf(503, 403) || response.header("Server", "")?.startsWith("cloudflare", true) != true) {
+                return response
+            }
+
+            val body = try { response.peekBody(Long.MAX_VALUE).string() } catch (e: Exception) { "" }
+            if (!body.contains("cf-challenge-running", true)) {
+                return response
+            }
+
+            response.close()
+
+            try {
+                toast("Cloudflare challenge detected. Opening WebView...")
+                var webView: WebView? = null
+                val latch = CountDownLatch(1)
+                var newCookie: Cookie? = null
+
+                val userAgent = originalRequest.header("User-Agent")
+                    ?: preferences.getPrefCustomUA()?.takeIf { it.isNotBlank() }
+                    ?: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+
+                handler.post {
+                    val wv = WebView(Injekt.get<Application>())
+                    webView = wv
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        userAgentString = userAgent
+                    }
+                    wv.webViewClient = object : WebViewClient() {}
+                    wv.loadUrl(originalRequest.url.toString())
+                }
+
+                for (i in 1..20) {
+                    Thread.sleep(1000)
+                    val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
+                    if (cookies != null && "cf_clearance" in cookies) {
+                        toast("cf_clearance cookie found!")
+                        val clearanceCookieValue = cookies.split(';')
+                            .find { it.trim().startsWith("cf_clearance=") }
+                            ?.substringAfter("=")?.trim()
+
+                        if (clearanceCookieValue != null) {
+                            newCookie = Cookie.Builder()
+                                .name("cf_clearance")
+                                .value(clearanceCookieValue)
+                                .domain(originalRequest.url.host)
+                                .path("/")
+                                .build()
+                            break
+                        }
+                    }
+                }
+
+                handler.post {
+                    webView?.stopLoading()
+                    webView?.destroy()
+                }
+
+                latch.countDown()
+                latch.await(5, TimeUnit.SECONDS)
+
+                if (newCookie != null) {
+                    toast("Successfully solved challenge. Retrying request...")
+                    client.cookieJar.saveFromResponse(originalRequest.url, listOf(newCookie!!))
+                    return chain.proceed(originalRequest.newBuilder().build())
+                } else {
+                    toast("Failed to solve Cloudflare challenge: cf_clearance cookie not found.")
+                    throw IOException("Failed to solve Cloudflare challenge: cf_clearance cookie not found.")
+                }
+            } catch (e: Exception) {
+                toast("Cloudflare challenge failed: ${e.message}")
+                throw IOException("Failed to solve Cloudflare challenge. ${e.message}")
+            }
+        }
     }
 
     private fun getManga(book: Entry) = SManga.create().apply {
@@ -324,7 +463,7 @@ class Koharu(
         }
     }
 
-    override fun getMangaUrl(manga: SManga) = "https://$domainUrl/g/${manga.url}"
+    override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
 
     override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", headers)
 
@@ -339,7 +478,7 @@ class Koharu(
         )
     }
 
-    override fun getChapterUrl(chapter: SChapter) = "https://$domainUrl/g/${chapter.url}"
+    override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
 
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
         return client.newCall(pageListRequest(chapter))
@@ -368,6 +507,15 @@ class Koharu(
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
+            key = PREF_CLOUDFLARE_SOLVER
+            title = "Cloudflare Solver"
+            entries = arrayOf("Tachiyomi's Solver (Recommended)", "Custom WebView Solver")
+            entryValues = arrayOf("tachiyomi", "custom")
+            summary = "%s\n\nTachiyomi's solver is stable and handles Cloudflare automatically. The custom solver is for debugging and may be unstable."
+            setDefaultValue("tachiyomi")
+        }.also(screen::addPreference)
+
+        ListPreference(screen.context).apply {
             key = PREF_IMAGERES
             title = "Image Resolution"
             entries = arrayOf("780x", "980x", "1280x", "1600x", "Original")
@@ -390,12 +538,15 @@ class Koharu(
             summary = "Separate tags with commas (,).\n" +
                 "Excluding: ${alwaysExcludeTags()}"
         }.also(screen::addPreference)
+
+        addRandomUAPreferenceToScreen(screen)
     }
 
     private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
 
     companion object {
         const val PREFIX_ID_KEY_SEARCH = "id:"
+        private const val PREF_CLOUDFLARE_SOLVER = "pref_cloudflare_solver"
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
