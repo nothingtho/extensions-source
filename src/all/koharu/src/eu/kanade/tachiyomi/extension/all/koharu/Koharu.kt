@@ -149,7 +149,7 @@ class Koharu(
             val originalRequest = chain.request()
             val response = chain.proceed(originalRequest)
 
-            if (response.code !in listOf(503, 403) || !response.header("Server", "").startsWith("cloudflare", true)) {
+            if (response.code !in listOf(503, 403) || response.header("Server", "")?.startsWith("cloudflare", true) != true) {
                 return response
             }
 
