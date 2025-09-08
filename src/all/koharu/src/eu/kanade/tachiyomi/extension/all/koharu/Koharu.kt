@@ -6,7 +6,8 @@ import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
 import android.webkit.CookieManager
-import android.widget.Toast
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -47,10 +48,14 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class Koharu(
     override val lang: String = "all",
@@ -66,7 +71,6 @@ class Koharu(
 
     private val json: Json by injectLazy()
     private val preferences: SharedPreferences by getPreferencesLazy()
-    private val application: Application by injectLazy()
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
@@ -85,9 +89,10 @@ class Koharu(
 
     private fun getDomain(): String {
         try {
-            // Use a client that can handle Cloudflare challenges for this initial check
-            val host = client.newCall(GET(baseUrl, headers)).execute()
-                .request.url.host
+            val noRedirectClient = network.client.newBuilder().followRedirects(false).build()
+            val host = noRedirectClient.newCall(GET(baseUrl, headers)).execute()
+                .headers["Location"]?.toHttpUrlOrNull()?.host
+                ?: return baseUrl
             return "https://$host"
         } catch (_: Exception) {
             return baseUrl
@@ -103,9 +108,8 @@ class Koharu(
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
-            // The order is crucial. Scraper runs first, then the CrtInjector uses the scraped token.
-            .addInterceptor(CloudflareInterceptor())
             .addInterceptor(CrtInterceptor())
+            .addInterceptor(CloudflareInterceptor())
             .rateLimit(3)
             .build()
     }
@@ -113,7 +117,7 @@ class Koharu(
     private inner class CrtInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val token = preferences.getString(PREF_CF_TOKEN, null)
-                ?: return chain.proceed(chain.request()) // If no token, let it fail and be caught by CloudflareInterceptor
+                ?: return chain.proceed(chain.request())
 
             val originalRequest = chain.request()
             if (!originalRequest.url.toString().startsWith(apiUrl)) {
@@ -135,39 +139,60 @@ class Koharu(
     private inner class CloudflareInterceptor : Interceptor {
         private val handler = Handler(Looper.getMainLooper())
 
-        @SuppressLint("ApplySharedPref")
+        @SuppressLint("SetJavaScriptEnabled", "ApplySharedPref")
         override fun intercept(chain: Interceptor.Chain): Response {
-            val request = chain.request()
+            val originalRequest = chain.request()
+            val response = chain.proceed(originalRequest)
 
-            // Proactively scrape the token from the system's CookieManager.
-            // This is where the token lives after the user solves the captcha in the interactive WebView.
-            val cookieManager = CookieManager.getInstance()
-            val cookies = cookieManager.getCookie(request.url.toString()) ?: ""
-            val cfCookie = cookies.split(";").firstOrNull { it.trim().startsWith("cf_clearance=") }
+            // Check if Cloudflare is asking for a challenge
+            if (response.code !in listOf(503, 403) || response.header("Server")?.startsWith("cloudflare") != true) {
+                return response
+            }
 
-            if (cfCookie != null) {
-                val token = cfCookie.substringAfter("=").trim()
-                val oldToken = preferences.getString(PREF_CF_TOKEN, null)
+            response.close()
 
-                if (token.isNotEmpty() && token != oldToken) {
-                    // Save synchronously to prevent race conditions.
-                    preferences.edit().putString(PREF_CF_TOKEN, token).commit()
-                    handler.post {
-                        Toast.makeText(application, "Cloudflare token scraped and saved.", Toast.LENGTH_LONG).show()
+            // The request failed. Time to solve the challenge.
+            var webView: WebView? = null
+            val latch = CountDownLatch(1)
+
+            handler.post {
+                val wv = WebView(Injekt.get<Application>())
+                webView = wv
+                wv.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    // A modern User-Agent is crucial for passing the challenge
+                    userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
+                }
+
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        val cookies = CookieManager.getInstance().getCookie(url)
+                        if (cookies != null && "cf_clearance" in cookies) {
+                            val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
+                            if (clearanceCookie != null) {
+                                val token = clearanceCookie.substringAfter("=").trim()
+                                // Save the token to SharedPreferences for persistence
+                                preferences.edit().putString(PREF_CF_TOKEN, token).commit()
+                                latch.countDown()
+                            }
+                        }
                     }
                 }
+                wv.loadUrl(originalRequest.url.toString())
             }
 
-            val response = chain.proceed(request)
-
-            // If the request fails with a Cloudflare error, trigger the interactive WebView flow.
-            if (response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true) {
-                response.close()
-                // This specific error message is caught by the app to show the "Open in WebView" button.
-                throw IOException("Cloudflare challenge required. Please open in WebView, solve the captcha, and then retry.")
+            // Wait for the latch to be released, with a timeout
+            if (!latch.await(60, TimeUnit.SECONDS)) {
+                handler.post { webView?.destroy() }
+                throw IOException("Cloudflare WebView challenge timed out.")
             }
 
-            return response
+            handler.post { webView?.destroy() }
+
+            // Retry the original request, which will now use the saved token via CrtInterceptor
+            return chain.proceed(originalRequest)
         }
     }
 
