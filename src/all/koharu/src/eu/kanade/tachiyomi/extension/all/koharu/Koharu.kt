@@ -8,6 +8,7 @@ import android.os.Looper
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -44,6 +45,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.Cookie
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -75,6 +77,7 @@ class Koharu(
 
     private val json: Json by injectLazy()
     private val preferences: SharedPreferences by getPreferencesLazy()
+    private val handler by lazy { Handler(Looper.getMainLooper()) } // ADDED
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
@@ -106,49 +109,67 @@ class Koharu(
         .set("Referer", "$domainUrl/")
         .set("Origin", domainUrl)
 
+    // CHANGED: Client builder now selects solver based on preference
     override val client: OkHttpClient by lazy {
-        network.client.newBuilder()
+        val builder = when (preferences.getString(PREF_CLOUDFLARE_SOLVER, "tachiyomi")) {
+            "custom" -> {
+                toast("Using Custom WebView Solver")
+                network.client.newBuilder()
+                    .addInterceptor(CloudflareInterceptor())
+            }
+            else -> {
+                // This is the recommended client that handles CF automatically.
+                toast("Using Tachiyomi's Solver")
+                network.cloudflareClient.newBuilder()
+            }
+        }
+
+        builder
             .setRandomUserAgent(
                 userAgentType = preferences.getPrefUAType(),
                 customUA = preferences.getPrefCustomUA(),
                 filterInclude = listOf("chrome"),
             )
-            .addInterceptor(CrtInterceptor())
-            .addInterceptor(CloudflareInterceptor())
+            // Replaced CrtInterceptor with a cleaner lambda interceptor
+            .addInterceptor { chain ->
+                val originalRequest = chain.request()
+                val token = preferences.getString(PREF_CF_TOKEN, null)
+
+                if (token == null || !originalRequest.url.toString().startsWith(apiUrl)) {
+                    return@addInterceptor chain.proceed(originalRequest)
+                }
+
+                val newUrl = originalRequest.url.newBuilder()
+                    .addQueryParameter("crt", token)
+                    .build()
+
+                val newRequest = originalRequest.newBuilder()
+                    .url(newUrl)
+                    .build()
+
+                chain.proceed(newRequest)
+            }
             .rateLimit(3)
             .build()
     }
 
-    private inner class CrtInterceptor : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val token = preferences.getString(PREF_CF_TOKEN, null)
-                ?: return chain.proceed(chain.request())
-
-            val originalRequest = chain.request()
-            if (!originalRequest.url.toString().startsWith(apiUrl)) {
-                return chain.proceed(originalRequest)
-            }
-
-            val newUrl = originalRequest.url.newBuilder()
-                .addQueryParameter("crt", token)
-                .build()
-
-            val newRequest = originalRequest.newBuilder()
-                .url(newUrl)
-                .build()
-
-            return chain.proceed(newRequest)
+    // ADDED: Helper function for toasts
+    private fun toast(message: String) {
+        handler.post {
+            Toast.makeText(Injekt.get<Application>(), message, Toast.LENGTH_LONG).show()
         }
     }
 
-    private inner class CloudflareInterceptor : Interceptor {
-        private val handler = Handler(Looper.getMainLooper())
+    // REMOVED: CrtInterceptor is no longer needed
 
+    // CHANGED: CloudflareInterceptor is now fixed and has debug toasts
+    private inner class CloudflareInterceptor : Interceptor {
         @SuppressLint("SetJavaScriptEnabled", "ApplySharedPref")
         override fun intercept(chain: Interceptor.Chain): Response {
             val originalRequest = chain.request()
             val response = chain.proceed(originalRequest)
 
+            // Check if Cloudflare challenge is present
             if (response.code !in listOf(503, 403) || response.header("Server", "")?.startsWith("cloudflare", true) != true) {
                 return response
             }
@@ -158,11 +179,18 @@ class Koharu(
                 return response
             }
 
+            // Close the failing response
             response.close()
+
             try {
+                toast("Cloudflare challenge detected. Opening WebView...")
                 var webView: WebView? = null
                 val latch = CountDownLatch(1)
-                var resolved = false
+                var newCookie: Cookie? = null
+
+                val userAgent = originalRequest.header("User-Agent")
+                    ?: preferences.getPrefCustomUA().takeIf { it.isNotBlank() }
+                    ?: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
 
                 handler.post {
                     val wv = WebView(Injekt.get<Application>())
@@ -171,51 +199,57 @@ class Koharu(
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         databaseEnabled = true
-                        // FIX: Use Elvis operator to provide a fallback UA and fix build error
-                        userAgentString = originalRequest.header("User-Agent")
-                            ?: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+                        userAgentString = userAgent
                     }
-                    CookieManager.getInstance().setAcceptCookie(true)
-
                     wv.webViewClient = object : WebViewClient() {}
                     wv.loadUrl(originalRequest.url.toString())
                 }
 
                 // Polling for the cookie
-                for (i in 1..30) {
+                for (i in 1..20) {
                     Thread.sleep(1000)
                     val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
                     if (cookies != null && "cf_clearance" in cookies) {
-                        val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
-                        if (clearanceCookie != null) {
-                            val token = clearanceCookie.substringAfter("=").trim()
-                            preferences.edit().putString(PREF_CF_TOKEN, token).commit()
-                            resolved = true
-                            latch.countDown()
+                        toast("cf_clearance cookie found!")
+                        val clearanceCookieValue = cookies.split(';')
+                            .find { it.trim().startsWith("cf_clearance=") }
+                            ?.substringAfter("=")?.trim()
+
+                        if (clearanceCookieValue != null) {
+                            newCookie = Cookie.Builder()
+                                .name("cf_clearance")
+                                .value(clearanceCookieValue)
+                                .domain(originalRequest.url.host)
+                                .path("/")
+                                .build()
                             break
                         }
                     }
                 }
 
-                if (!resolved) {
-                    latch.countDown()
-                }
-
-                latch.await(5, TimeUnit.SECONDS)
-
+                // Destroy WebView on UI thread
                 handler.post {
                     webView?.stopLoading()
                     webView?.destroy()
                 }
 
-                if (!resolved) {
+                latch.countDown()
+                latch.await(5, TimeUnit.SECONDS)
+
+                if (newCookie != null) {
+                    toast("Successfully solved challenge. Retrying request...")
+                    // Add the cookie to the client's cookie jar
+                    client.cookieJar.saveFromResponse(originalRequest.url, listOf(newCookie!!))
+                    // Retry the request. The cookie jar will now automatically add the cookie.
+                    return chain.proceed(originalRequest.newBuilder().build())
+                } else {
+                    toast("Failed to solve Cloudflare challenge: cf_clearance cookie not found.")
                     throw IOException("Failed to solve Cloudflare challenge: cf_clearance cookie not found.")
                 }
             } catch (e: Exception) {
+                toast("Cloudflare challenge failed: ${e.message}")
                 throw IOException("Failed to solve Cloudflare challenge. ${e.message}")
             }
-
-            return chain.proceed(originalRequest)
         }
     }
 
@@ -260,8 +294,7 @@ class Koharu(
         }
 
         val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", headers)).execute()
-        val images = imagesResponse.parseAs<ImagesInfo>() to realQuality
-        return images
+        return imagesResponse.parseAs<ImagesInfo>() to realQuality
     }
 
     override fun latestUpdatesRequest(page: Int) = GET(
@@ -470,6 +503,16 @@ class Koharu(
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        // ADDED: Preference to select the Cloudflare solver
+        ListPreference(screen.context).apply {
+            key = PREF_CLOUDFLARE_SOLVER
+            title = "Cloudflare Solver"
+            entries = arrayOf("Tachiyomi's Solver (Recommended)", "Custom WebView Solver")
+            entryValues = arrayOf("tachiyomi", "custom")
+            summary = "%s\n\nTachiyomi's solver is stable and handles Cloudflare automatically. The custom solver is for debugging and may be unstable."
+            setDefaultValue("tachiyomi")
+        }.also(screen::addPreference)
+
         ListPreference(screen.context).apply {
             key = PREF_IMAGERES
             title = "Image Resolution"
@@ -501,10 +544,11 @@ class Koharu(
 
     companion object {
         const val PREFIX_ID_KEY_SEARCH = "id:"
+        private const val PREF_CLOUDFLARE_SOLVER = "pref_cloudflare_solver" // ADDED
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
-        private const val PREF_CF_TOKEN = "pref_cloudflare_token"
+        private const val PREF_CF_TOKEN = "pref_schale_token" // Renamed to avoid confusion
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
     }
 }
