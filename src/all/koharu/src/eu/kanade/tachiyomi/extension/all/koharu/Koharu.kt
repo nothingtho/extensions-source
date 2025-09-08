@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.extension.all.koharu
 
-import android.app.Application
 import android.content.SharedPreferences
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
@@ -35,12 +34,12 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
-import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -51,12 +50,12 @@ class Koharu(
     private val searchLang: String = "",
 ) : HttpSource(), ConfigurableSource {
 
-    override val name = "SchaleNetwork"
-    override val baseUrl = "https://schale.network"
+    override val name = "Niyaniya"
+    override val baseUrl = "https://niyaniya.moe"
     override val id = if (lang == "en") 1484902275639232927 else super.id
 
-    private val apiUrl = baseUrl.replace("://", "://api.")
-    private val authUrl = baseUrl.replace("://", "://auth.")
+    private val apiUrl = "https://api.schale.network"
+    private val authUrl = "https://auth.schale.network"
     private val apiBooksUrl = "$apiUrl/books"
 
     override val supportsLatest = true
@@ -70,9 +69,20 @@ class Koharu(
     private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
     private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
 
+    private val domainUrl by lazy { getDomain() }
+
+    private fun getDomain(): String {
+        return try {
+            val response = network.client.newCall(GET(baseUrl, headers)).execute()
+            response.request.url.host
+        } catch (e: Exception) {
+            baseUrl.toHttpUrl().host
+        }
+    }
+
     override fun headersBuilder() = super.headersBuilder()
-        .set("Referer", "$baseUrl/")
-        .set("Origin", baseUrl)
+        .set("Referer", "https://$domainUrl/")
+        .set("Origin", "https://$domainUrl")
 
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .addInterceptor(::schaleTokenInterceptor)
@@ -85,7 +95,7 @@ class Koharu(
     private fun schaleTokenInterceptor(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
 
-        // Pass through non-API requests
+        // Pass through non-API requests (e.g., the token request itself)
         if (!originalRequest.url.host.startsWith("api.")) {
             return chain.proceed(originalRequest)
         }
@@ -102,8 +112,7 @@ class Koharu(
 
         val response = chain.proceed(newRequest)
 
-        // If the token is rejected (e.g., expired), clear it and retry the request once.
-        // This makes the extension self-healing.
+        // If the token is rejected, clear it and retry the request once.
         if (response.code in listOf(400, 403)) {
             response.close()
             clearToken()
@@ -122,14 +131,14 @@ class Koharu(
     }
 
     private fun getOrFetchToken(): String {
-        // Check if we have a valid stored token
         val storedToken = preferences.getString(PREF_SCHALE_TOKEN, null)
         if (storedToken != null) {
             return storedToken
         }
 
-        // If not, fetch a new one. This client can already bypass Cloudflare.
-        val tokenResponse = client.newCall(GET("$authUrl/clearance", headers)).execute()
+        // Use a temporary client to fetch the token to avoid interceptor loops
+        val tokenClient = network.cloudflareClient
+        val tokenResponse = tokenClient.newCall(GET("$authUrl/clearance", headers)).execute()
 
         if (!tokenResponse.isSuccessful) {
             throw IOException("Failed to fetch Schale token (HTTP ${tokenResponse.code})")
@@ -193,7 +202,7 @@ class Koharu(
             addQueryParameter("page", page.toString())
             val terms: MutableList<String> = mutableListOf()
             if (lang != "all") terms += "language:\"^$searchLang$\""
-            alwaysExcludeTags().takeIf { it.isNotBlank() }?.let {
+            alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
                 terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
@@ -209,7 +218,7 @@ class Koharu(
             addQueryParameter("page", page.toString())
             val terms: MutableList<String> = mutableListOf()
             if (lang != "all") terms += "language:\"^$searchLang$\""
-            alwaysExcludeTags().takeIf { it.isNotBlank() }?.let {
+            alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
                 terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
@@ -239,14 +248,14 @@ class Koharu(
             val includedTags: MutableList<Int> = mutableListOf()
             val excludedTags: MutableList<Int> = mutableListOf()
             if (lang != "all") terms += "language:\"^$searchLang$\""
-            alwaysExcludeTags().takeIf { it.isNotBlank() }?.let {
+            alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
                 terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
             }
             filters.forEach { filter ->
                 when (filter) {
                     is KoharuFilters.SortFilter -> addQueryParameter("sort", filter.getValue())
                     is KoharuFilters.CategoryFilter -> filter.state.filter { it.state }.let {
-                        if (it.isNotEmpty()) addQueryParameter("cat", it.sumOf(Tag::value).toString())
+                        if (it.isNotEmpty()) addQueryParameter("cat", it.sumOf { it.value }.toString())
                     }
                     is KoharuFilters.TagFilter -> {
                         includedTags += filter.state.filter { it.isIncluded() }.map { it.id }
@@ -315,7 +324,7 @@ class Koharu(
         }
     }
 
-    override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
+    override fun getMangaUrl(manga: SManga) = "https://$domainUrl/g/${manga.url}"
 
     override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", headers)
 
@@ -330,7 +339,7 @@ class Koharu(
         )
     }
 
-    override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
+    override fun getChapterUrl(chapter: SChapter) = "https://$domainUrl/g/${chapter.url}"
 
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
         return client.newCall(pageListRequest(chapter))
@@ -342,9 +351,10 @@ class Koharu(
 
     override fun pageListParse(response: Response): List<Page> {
         val mangaData = response.parseAs<MangaData>()
-        val url = response.request.url
-        val entryId = url.pathSegments[2]
-        val entryKey = url.pathSegments[3]
+        val urlString = response.request.url.toString()
+        val matches = Regex("""/detail/(\d+)/([a-z\d]+)""").find(urlString)
+            ?: throw IOException("Failed to parse URL: $urlString")
+        val (entryId, entryKey) = matches.destructured
         val imagesInfo = getImagesByMangaData(mangaData, entryId, entryKey)
 
         return imagesInfo.first.entries.mapIndexed { index, image ->
