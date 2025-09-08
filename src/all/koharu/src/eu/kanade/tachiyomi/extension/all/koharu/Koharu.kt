@@ -9,6 +9,7 @@ import android.webkit.CookieManager
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
+import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.artistList
@@ -39,7 +40,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
-import okhttp3.Cookie
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -86,6 +86,7 @@ class Koharu(
 
     private fun getDomain(): String {
         try {
+            // Use a client that can handle Cloudflare challenges for this initial check
             val host = client.newCall(GET(baseUrl, headers)).execute()
                 .request.url.host
             return "https://$host"
@@ -101,11 +102,9 @@ class Koharu(
             .build()
     }
 
-    private val webViewCookieJar = WebViewCookieJar()
-
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
-            .cookieJar(webViewCookieJar)
+            // The order is crucial. Scraper runs first, then the CrtInjector uses the scraped token.
             .addInterceptor(CloudflareInterceptor())
             .addInterceptor(CrtInterceptor())
             .rateLimit(3)
@@ -115,7 +114,7 @@ class Koharu(
     private inner class CrtInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val token = preferences.getString(PREF_CF_TOKEN, null)
-                ?: return chain.proceed(chain.request())
+                ?: return chain.proceed(chain.request()) // If no token, let it fail and be caught by CloudflareInterceptor
 
             val originalRequest = chain.request()
             if (!originalRequest.url.toString().startsWith(apiUrl)) {
@@ -141,22 +140,31 @@ class Koharu(
         override fun intercept(chain: Interceptor.Chain): Response {
             val request = chain.request()
 
-            val cookies = webViewCookieJar.loadForRequest(baseUrl.toHttpUrl())
-            cookies.firstOrNull { it.name == "cf_clearance" }?.let { cookie ->
+            // Proactively scrape the token from the system's CookieManager.
+            // This is where the token lives after the user solves the captcha in the interactive WebView.
+            val cookieManager = CookieManager.getInstance()
+            val cookies = cookieManager.getCookie(request.url.toString()) ?: ""
+            val cfCookie = cookies.split(";").firstOrNull { it.trim().startsWith("cf_clearance=") }
+
+            if (cfCookie != null) {
+                val token = cfCookie.substringAfter("=").trim()
                 val oldToken = preferences.getString(PREF_CF_TOKEN, null)
-                if (cookie.value != oldToken) {
-                    // Use commit() to save synchronously, preventing a race condition
-                    preferences.edit().putString(PREF_CF_TOKEN, cookie.value).commit()
+
+                if (token.isNotEmpty() && token != oldToken) {
+                    // Save synchronously to prevent race conditions.
+                    preferences.edit().putString(PREF_CF_TOKEN, token).commit()
                     handler.post {
-                        Toast.makeText(application, "Cloudflare token scraped successfully.", Toast.LENGTH_LONG).show()
+                        Toast.makeText(application, "Cloudflare token scraped and saved.", Toast.LENGTH_LONG).show()
                     }
                 }
             }
 
             val response = chain.proceed(request)
 
+            // If the request fails with a Cloudflare error, trigger the interactive WebView flow.
             if (response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true) {
                 response.close()
+                // This specific error message is caught by the app to show the "Open in WebView" button.
                 throw IOException("Cloudflare challenge required. Please open in WebView, solve the captcha, and then retry.")
             }
 
@@ -209,6 +217,7 @@ class Koharu(
         return images
     }
 
+    // ... (rest of the source methods are unchanged)
     override fun latestUpdatesRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
@@ -438,6 +447,17 @@ class Koharu(
             summary = "Separate tags with commas (,).\n" +
                 "Excluding: ${alwaysExcludeTags()}"
         }.also(screen::addPreference)
+
+        // Add a button to clear the saved token for troubleshooting.
+        Preference(screen.context).apply {
+            title = "Clear saved Cloudflare token"
+            summary = "If you're stuck in a captcha loop, try clearing the token and solving it again in WebView."
+            setOnPreferenceClickListener {
+                preferences.edit().remove(PREF_CF_TOKEN).apply()
+                Toast.makeText(screen.context, "Token cleared.", Toast.LENGTH_SHORT).show()
+                true
+            }
+        }.also(screen::addPreference)
     }
 
     private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
@@ -449,27 +469,5 @@ class Koharu(
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
         private const val PREF_CF_TOKEN = "pref_cloudflare_token"
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
-    }
-}
-
-class WebViewCookieJar : okhttp3.CookieJar {
-    private val cookieManager = CookieManager.getInstance()
-
-    override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<Cookie>) {
-        val urlString = url.toString()
-        cookies.forEach { cookie ->
-            cookieManager.setCookie(urlString, cookie.toString())
-        }
-    }
-
-    override fun loadForRequest(url: okhttp3.HttpUrl): List<Cookie> {
-        val cookiesString = cookieManager.getCookie(url.toString())
-        return if (cookiesString != null && cookiesString.isNotEmpty()) {
-            cookiesString.split(";").mapNotNull { cookieString ->
-                Cookie.parse(url, cookieString.trim())
-            }
-        } else {
-            emptyList()
-        }
     }
 }
