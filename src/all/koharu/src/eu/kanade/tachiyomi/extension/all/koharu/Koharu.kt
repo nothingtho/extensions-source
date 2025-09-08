@@ -93,7 +93,8 @@ class Koharu(
     private fun getDomain(): String {
         try {
             val noRedirectClient = network.client.newBuilder().followRedirects(false).build()
-            val host = noRedirectClient.newCall(GET(baseUrl, headers)).execute()
+            // FIX: Use `network.headers` to prevent the StackOverflowError crash.
+            val host = noRedirectClient.newCall(GET(baseUrl, network.headers)).execute()
                 .headers["Location"]?.toHttpUrlOrNull()?.host
                 ?: return baseUrl
             return "https://$host"
