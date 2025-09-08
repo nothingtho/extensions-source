@@ -73,7 +73,7 @@ class Koharu(
     override val baseUrl = "https://niyaniya.moe"
     override val id = if (lang == "en") 1484902275639232927 else super.id
     private val apiUrl = "https://api.schale.network"
-    private val authUrl = "https://auth.schale.network" // ADDED
+    private val authUrl = "https://auth.schale.network"
     private val apiBooksUrl = "$apiUrl/books"
     override val supportsLatest = true
 
@@ -111,7 +111,7 @@ class Koharu(
         .set("Referer", "$domainUrl/")
         .set("Origin", domainUrl)
 
-    // MODIFIED: Replaced the old interceptor with the new, functional one
+    // The default "browsing" client. Does NOT have the crt token interceptor.
     override val client: OkHttpClient by lazy {
         val builder = when (preferences.getString(PREF_CLOUDFLARE_SOLVER, "tachiyomi")) {
             "custom" -> {
@@ -131,26 +131,24 @@ class Koharu(
                 customUA = preferences.getPrefCustomUA(),
                 filterInclude = listOf("chrome"),
             )
-            .addInterceptor(::schaleTokenInterceptor) // REPLACED old lambda with this
             .rateLimit(3)
             .build()
     }
 
-    // ADDED: A variable to hold the token in memory for the current session
+    // A dedicated "reading" client that adds the crt token to its requests.
+    private val pageClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .addInterceptor(::schaleTokenInterceptor)
+            .build()
+    }
+
     private var clearanceToken: String? = null
 
     @Serializable
     private data class SchaleToken(val token: String)
 
-    // ADDED: The new, self-healing interceptor
     private fun schaleTokenInterceptor(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
-
-        // Pass through non-API requests
-        if (!originalRequest.url.host.startsWith("api.")) {
-            return chain.proceed(originalRequest)
-        }
-
         val token = getOrFetchToken()
 
         val newRequest = originalRequest.newBuilder()
@@ -163,7 +161,6 @@ class Koharu(
 
         val response = chain.proceed(newRequest)
 
-        // If the token is rejected, invalidate it and retry the request once.
         if (response.code in listOf(400, 403)) {
             response.close()
             clearanceToken = null // Invalidate the in-memory token
@@ -181,14 +178,11 @@ class Koharu(
         return response
     }
 
-    // ADDED: Helper functions to manage the ephemeral token
     private fun getOrFetchToken(): String {
-        // If we have a token in memory, use it.
         clearanceToken?.let { return it }
 
-        // Otherwise, fetch a new one.
-        val tokenClient = network.cloudflareClient
-        val tokenResponse = tokenClient.newCall(GET("$authUrl/clearance", headers)).execute()
+        // Use the base client to fetch the token, as this request doesn't need a token itself
+        val tokenResponse = client.newCall(GET("$authUrl/clearance", headers)).execute()
 
         if (!tokenResponse.isSuccessful) {
             throw IOException("Failed to fetch clearance token (HTTP ${tokenResponse.code})")
@@ -276,7 +270,13 @@ class Koharu(
 
                 if (newCookie != null) {
                     toast("Successfully solved challenge. Retrying request...")
-                    client.cookieJar.saveFromResponse(originalRequest.url, listOf(newCookie!!))
+                    // Use the correct client's cookie jar
+                    val clientToUpdate = if (preferences.getString(PREF_CLOUDFLARE_SOLVER, "tachiyomi") == "custom") {
+                        client
+                    } else {
+                        network.cloudflareClient
+                    }
+                    clientToUpdate.cookieJar.saveFromResponse(originalRequest.url, listOf(newCookie!!))
                     return chain.proceed(originalRequest.newBuilder().build())
                 } else {
                     toast("Failed to solve Cloudflare challenge: cf_clearance cookie not found.")
@@ -329,10 +329,12 @@ class Koharu(
             else -> "0"
         }
 
-        val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", headers)).execute()
+        // CORRECT: Use the pageClient for this API call
+        val imagesResponse = pageClient.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", headers)).execute()
         return imagesResponse.parseAs<ImagesInfo>() to realQuality
     }
 
+    // All browsing requests use the default `client` implicitly
     override fun latestUpdatesRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
@@ -477,13 +479,14 @@ class Koharu(
 
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
 
+    // CORRECT: This is the entry point for reading, so it MUST use the pageClient
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return client.newCall(pageListRequest(chapter))
+        return pageClient.newCall(pageListRequest(chapter))
             .asObservableSuccess()
             .map(::pageListParse)
     }
 
-    // CORRECTED: This must be a POST request, as confirmed by the site's own JavaScript
+    // This request needs the crt token, but it gets it from the pageClient via fetchPageList
     override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
@@ -499,6 +502,7 @@ class Koharu(
         }
     }
 
+    // Image requests go to a CDN and don't need the token, so the default client is fine.
     override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers)
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
@@ -548,7 +552,7 @@ class Koharu(
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
-        // REMOVED PREF_SCHALE_TOKEN as we are now storing the token in-memory
+        // REMOVED PREF_SCHALE_TOKEN as the token is now ephemeral and stored in memory
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
     }
 }
