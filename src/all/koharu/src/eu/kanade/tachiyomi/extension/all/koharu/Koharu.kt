@@ -21,7 +21,7 @@ import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
-import eu.kanade.tachiyomi.network.interceptor.WebViewInterceptor // <-- FIX: Added missing import
+import eu.kanade.tachiyomi.network.interceptor.WebViewInterceptor
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -79,6 +79,7 @@ class Koharu(
 
     private fun getDomain(): String {
         try {
+            // FIX: Removed `headers` from GET call to prevent recursion
             val noRedirectClient = network.client.newBuilder().followRedirects(false).build()
             val host = noRedirectClient.newCall(GET(baseUrl)).execute()
                 .headers["Location"]?.toHttpUrlOrNull()?.host
@@ -99,14 +100,13 @@ class Koharu(
     private val webViewInterceptor by lazy {
         WebViewInterceptor(
             Injekt.get<Application>(),
-            // FIX: Explicitly define the `response` parameter for the lambda
+            // FIX: Corrected lambda syntax with explicit parameters
             predicate = { response: Response -> response.header("Server").equals("cloudflare", ignoreCase = true) },
-            // FIX: Explicitly define the `response` parameter for the lambda
             onChallenge = { response: Response -> response.body?.string()?.contains("Verify you are human") == true },
         )
     }
 
-    // FIX: Removed `by lazy` from the client override
+    // FIX: Corrected client override syntax
     override val client: OkHttpClient = network.client.newBuilder()
         .addInterceptor(webViewInterceptor)
         .rateLimit(3)
