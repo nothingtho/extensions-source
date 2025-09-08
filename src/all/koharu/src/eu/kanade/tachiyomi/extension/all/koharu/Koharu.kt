@@ -79,7 +79,6 @@ class Koharu(
 
     private fun getDomain(): String {
         try {
-            // FIX: Removed `headers` from GET call to prevent recursion
             val noRedirectClient = network.client.newBuilder().followRedirects(false).build()
             val host = noRedirectClient.newCall(GET(baseUrl)).execute()
                 .headers["Location"]?.toHttpUrlOrNull()?.host
@@ -100,13 +99,11 @@ class Koharu(
     private val webViewInterceptor by lazy {
         WebViewInterceptor(
             Injekt.get<Application>(),
-            // FIX: Corrected lambda syntax with explicit parameters
             predicate = { response: Response -> response.header("Server").equals("cloudflare", ignoreCase = true) },
             onChallenge = { response: Response -> response.body?.string()?.contains("Verify you are human") == true },
         )
     }
 
-    // FIX: Corrected client override syntax
     override val client: OkHttpClient = network.client.newBuilder()
         .addInterceptor(webViewInterceptor)
         .rateLimit(3)
