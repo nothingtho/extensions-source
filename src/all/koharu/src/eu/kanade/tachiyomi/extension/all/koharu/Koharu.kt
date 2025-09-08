@@ -1,8 +1,12 @@
 package eu.kanade.tachiyomi.extension.all.koharu
 
 import android.annotation.SuppressLint
+import android.app.Application
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
 import android.webkit.CookieManager
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -44,6 +48,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -63,6 +69,7 @@ class Koharu(
 
     private val json: Json by injectLazy()
     private val preferences: SharedPreferences by getPreferencesLazy()
+    private val application: Application by injectLazy()
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
@@ -81,7 +88,6 @@ class Koharu(
 
     private fun getDomain(): String {
         try {
-            // Use a client that can handle Cloudflare challenges for this initial check
             val host = client.newCall(GET(baseUrl, headers)).execute()
                 .request.url.host
             return "https://$host"
@@ -131,23 +137,31 @@ class Koharu(
     }
 
     private inner class CloudflareInterceptor : Interceptor {
+        private val handler = Handler(Looper.getMainLooper())
+
         @SuppressLint("ApplySharedPref")
         override fun intercept(chain: Interceptor.Chain): Response {
-            val originalRequest = chain.request()
-            val response = chain.proceed(originalRequest)
+            val request = chain.request()
 
-            // Check if Cloudflare is asking for a challenge
-            if (response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true) {
-                response.close()
-                throw IOException("Open in WebView and solve the Cloudflare challenge.")
+            // Proactively check for the token from the WebView's cookie jar BEFORE the request
+            val cookies = webViewCookieJar.loadForRequest(baseUrl.toHttpUrl())
+            cookies.firstOrNull { it.name == "cf_clearance" }?.let { cookie ->
+                val oldToken = preferences.getString(PREF_CF_TOKEN, null)
+                // If the token is new, save it and notify the user
+                if (cookie.value != oldToken) {
+                    preferences.edit().putString(PREF_CF_TOKEN, cookie.value).apply()
+                    handler.post {
+                        Toast.makeText(application, "Cloudflare token scraped successfully.", Toast.LENGTH_LONG).show()
+                    }
+                }
             }
 
-            // After a successful request, scrape the token and save it.
-            // This happens after the user solves the captcha in WebView and retries.
-            val cookies = webViewCookieJar.loadForRequest(originalRequest.url)
-            cookies.firstOrNull { it.name == "cf_clearance" }?.let { cookie ->
-                // Save the token to be used by CrtInterceptor
-                preferences.edit().putString(PREF_CF_TOKEN, cookie.value).commit()
+            val response = chain.proceed(request)
+
+            // If the request fails with a Cloudflare error, trigger the WebView flow
+            if (response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true) {
+                response.close()
+                throw IOException("Cloudflare challenge required. Please open in WebView, solve the captcha, and then retry.")
             }
 
             return response
@@ -442,11 +456,6 @@ class Koharu(
     }
 }
 
-/**
- * A custom CookieJar that bridges OkHttp's cookies with Android's system WebView cookies.
- * This is crucial for handling Cloudflare challenges, as the user solves the challenge
- * in a WebView, and this class makes the resulting cookies available to OkHttp.
- */
 class WebViewCookieJar : okhttp3.CookieJar {
     private val cookieManager = CookieManager.getInstance()
 
@@ -460,7 +469,6 @@ class WebViewCookieJar : okhttp3.CookieJar {
     override fun loadForRequest(url: okhttp3.HttpUrl): List<Cookie> {
         val cookiesString = cookieManager.getCookie(url.toString())
         return if (cookiesString != null && cookiesString.isNotEmpty()) {
-            // The cookies string is a semicolon-separated list of "name=value" pairs
             cookiesString.split(";").mapNotNull { cookieString ->
                 Cookie.parse(url, cookieString.trim())
             }
