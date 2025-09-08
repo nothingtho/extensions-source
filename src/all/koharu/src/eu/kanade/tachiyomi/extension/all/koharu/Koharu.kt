@@ -9,7 +9,6 @@ import android.webkit.CookieManager
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
-import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.artistList
@@ -217,7 +216,6 @@ class Koharu(
         return images
     }
 
-    // ... (rest of the source methods are unchanged)
     override fun latestUpdatesRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
@@ -446,17 +444,6 @@ class Koharu(
             title = "Tags to exclude from browse/search"
             summary = "Separate tags with commas (,).\n" +
                 "Excluding: ${alwaysExcludeTags()}"
-        }.also(screen::addPreference)
-
-        // Add a button to clear the saved token for troubleshooting.
-        Preference(screen.context).apply {
-            title = "Clear saved Cloudflare token"
-            summary = "If you're stuck in a captcha loop, try clearing the token and solving it again in WebView."
-            setOnPreferenceClickListener {
-                preferences.edit().remove(PREF_CF_TOKEN).apply()
-                Toast.makeText(screen.context, "Token cleared.", Toast.LENGTH_SHORT).show()
-                true
-            }
         }.also(screen::addPreference)
     }
 
