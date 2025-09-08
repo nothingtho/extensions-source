@@ -23,6 +23,10 @@ import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.otherList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.parodyList
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetchAttempts
 import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetched
+import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
+import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
+import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
+import eu.kanade.tachiyomi.lib.randomua.setRandomUserAgent
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
@@ -99,15 +103,17 @@ class Koharu(
         }
     }
 
-    private fun apiHeaders(): Headers {
-        return headersBuilder()
-            .set("Referer", "$domainUrl/")
-            .set("Origin", domainUrl)
-            .build()
-    }
+    override fun headersBuilder() = super.headersBuilder()
+        .set("Referer", "$domainUrl/")
+        .set("Origin", domainUrl)
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
+            .setRandomUserAgent(
+                userAgentType = preferences.getPrefUAType(),
+                customUA = preferences.getPrefCustomUA(),
+                filterInclude = listOf("chrome"),
+            )
             .addInterceptor(CrtInterceptor())
             .addInterceptor(CloudflareInterceptor())
             .rateLimit(3)
@@ -144,54 +150,55 @@ class Koharu(
             val originalRequest = chain.request()
             val response = chain.proceed(originalRequest)
 
-            // Check if Cloudflare is asking for a challenge
-            if (response.code !in listOf(503, 403) || response.header("Server")?.startsWith("cloudflare") != true) {
+            if (response.code !in listOf(503, 403) || !response.header("Server", "").startsWith("cloudflare", true)) {
                 return response
             }
 
             response.close()
+            try {
+                var webView: WebView? = null
+                val latch = CountDownLatch(1)
 
-            // The request failed. Time to solve the challenge.
-            var webView: WebView? = null
-            val latch = CountDownLatch(1)
+                handler.post {
+                    val wv = WebView(Injekt.get<Application>())
+                    webView = wv
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        userAgentString = originalRequest.header("User-Agent") // Use the same UA as the client
+                    }
+                    CookieManager.getInstance().setAcceptCookie(true)
 
-            handler.post {
-                val wv = WebView(Injekt.get<Application>())
-                webView = wv
-                wv.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    // A modern User-Agent is crucial for passing the challenge
-                    userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
-                }
-
-                wv.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        val cookies = CookieManager.getInstance().getCookie(url)
-                        if (cookies != null && "cf_clearance" in cookies) {
-                            val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
-                            if (clearanceCookie != null) {
-                                val token = clearanceCookie.substringAfter("=").trim()
-                                // Save the token to SharedPreferences for persistence
-                                preferences.edit().putString(PREF_CF_TOKEN, token).commit()
-                                latch.countDown()
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            val cookies = CookieManager.getInstance().getCookie(url)
+                            if (cookies != null && "cf_clearance" in cookies) {
+                                val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
+                                if (clearanceCookie != null) {
+                                    val token = clearanceCookie.substringAfter("=").trim()
+                                    // Save the token to SharedPreferences for persistence
+                                    preferences.edit().putString(PREF_CF_TOKEN, token).commit()
+                                    latch.countDown()
+                                }
                             }
                         }
                     }
+                    wv.loadUrl(originalRequest.url.toString())
                 }
-                wv.loadUrl(originalRequest.url.toString())
+
+                if (!latch.await(60, TimeUnit.SECONDS)) {
+                    throw IOException("Failed to solve Cloudflare challenge: WebView timed out.")
+                }
+
+                handler.post {
+                    webView?.stopLoading()
+                    webView?.destroy()
+                }
+            } catch (e: Exception) {
+                throw IOException("Failed to solve Cloudflare challenge. ${e.message}")
             }
 
-            // Wait for the latch to be released, with a timeout
-            if (!latch.await(60, TimeUnit.SECONDS)) {
-                handler.post { webView?.destroy() }
-                throw IOException("Cloudflare WebView challenge timed out.")
-            }
-
-            handler.post { webView?.destroy() }
-
-            // Retry the original request, which will now use the saved token via CrtInterceptor
             return chain.proceed(originalRequest)
         }
     }
@@ -236,7 +243,7 @@ class Koharu(
             else -> "0"
         }
 
-        val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", apiHeaders())).execute()
+        val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", headers)).execute()
         val images = imagesResponse.parseAs<ImagesInfo>() to realQuality
         return images
     }
@@ -254,7 +261,7 @@ class Koharu(
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
-        apiHeaders(),
+        headers,
     )
 
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
@@ -273,7 +280,7 @@ class Koharu(
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
-        apiHeaders(),
+        headers,
     )
 
     override fun popularMangaParse(response: Response): MangasPage {
@@ -285,7 +292,7 @@ class Koharu(
         return when {
             query.startsWith(PREFIX_ID_KEY_SEARCH) -> {
                 val ipk = query.removePrefix(PREFIX_ID_KEY_SEARCH)
-                val response = client.newCall(GET("$apiBooksUrl/detail/$ipk", apiHeaders())).execute()
+                val response = client.newCall(GET("$apiBooksUrl/detail/$ipk", headers)).execute()
                 Observable.just(
                     MangasPage(listOf(mangaDetailsParse(response)), false),
                 )
@@ -353,7 +360,7 @@ class Koharu(
             addQueryParameter("page", page.toString())
         }.build()
 
-        return GET(url, apiHeaders())
+        return GET(url, headers)
     }
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
@@ -371,7 +378,7 @@ class Koharu(
         if (tagsFetchAttempts < 3 && !tagsFetched) {
             try {
                 client.newCall(
-                    GET("$apiBooksUrl/tags/filters", apiHeaders()),
+                    GET("$apiBooksUrl/tags/filters", headers),
                 ).execute()
                     .use { it.parseAs<List<Filter>>() }
                     .also { tagsFetched = true }
@@ -394,7 +401,7 @@ class Koharu(
         }
     }
 
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", apiHeaders())
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", headers)
 
     override fun mangaDetailsParse(response: Response): SManga {
         val mangaDetail = response.parseAs<MangaDetail>()
@@ -406,7 +413,7 @@ class Koharu(
 
     override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
 
-    override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", apiHeaders())
+    override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", headers)
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val manga = response.parseAs<MangaDetail>()
@@ -427,7 +434,7 @@ class Koharu(
             .map(::pageListParse)
     }
 
-    override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", apiHeaders())
+    override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
         val mangaData = response.parseAs<MangaData>()
@@ -442,7 +449,7 @@ class Koharu(
         }
     }
 
-    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, apiHeaders())
+    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers)
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 
@@ -470,6 +477,8 @@ class Koharu(
             summary = "Separate tags with commas (,).\n" +
                 "Excluding: ${alwaysExcludeTags()}"
         }.also(screen::addPreference)
+
+        addRandomUAPreferenceToScreen(screen)
     }
 
     private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
