@@ -58,8 +58,6 @@ import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 class Koharu(
     override val lang: String = "all",
@@ -83,7 +81,6 @@ class Koharu(
     private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
 
     private var _domainUrl: String? = null
-
     private val domainUrl: String
         get() = _domainUrl ?: run {
             val domain = getDomain()
@@ -103,7 +100,7 @@ class Koharu(
         }
     }
 
-    override fun headersBuilder() = super.headersBuilder()
+    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .set("Referer", "$domainUrl/")
         .set("Origin", domainUrl)
 
@@ -166,29 +163,39 @@ class Koharu(
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         databaseEnabled = true
-                        userAgentString = originalRequest.header("User-Agent") // Use the same UA as the client
+                        userAgentString = originalRequest.header("User-Agent")
                     }
                     CookieManager.getInstance().setAcceptCookie(true)
 
                     wv.webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView?, url: String?) {
-                            val cookies = CookieManager.getInstance().getCookie(url)
-                            if (cookies != null && "cf_clearance" in cookies) {
-                                val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
-                                if (clearanceCookie != null) {
-                                    val token = clearanceCookie.substringAfter("=").trim()
-                                    // Save the token to SharedPreferences for persistence
-                                    preferences.edit().putString(PREF_CF_TOKEN, token).commit()
-                                    latch.countDown()
+                            Thread {
+                                var resolved = false
+                                for (i in 1..20) { // Poll for 20 seconds
+                                    Thread.sleep(1000)
+                                    val cookies = CookieManager.getInstance().getCookie(url)
+                                    if (cookies != null && "cf_clearance" in cookies) {
+                                        val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
+                                        if (clearanceCookie != null) {
+                                            val token = clearanceCookie.substringAfter("=").trim()
+                                            preferences.edit().putString(PREF_CF_TOKEN, token).commit()
+                                            resolved = true
+                                            latch.countDown()
+                                            break
+                                        }
+                                    }
                                 }
-                            }
+                                if (!resolved) {
+                                    latch.countDown() // Timeout
+                                }
+                            }.start()
                         }
                     }
                     wv.loadUrl(originalRequest.url.toString())
                 }
 
-                if (!latch.await(60, TimeUnit.SECONDS)) {
-                    throw IOException("Failed to solve Cloudflare challenge: WebView timed out.")
+                if (!latch.await(30, TimeUnit.SECONDS)) { // 30s total timeout
+                    throw IOException("WebView timed out.")
                 }
 
                 handler.post {
