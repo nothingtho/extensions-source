@@ -153,8 +153,7 @@ class Koharu(
                 return response
             }
 
-            // Use peekBody to check for challenge without consuming the response body
-            val body = response.peekBody(Long.MAX_VALUE).string()
+            val body = try { response.peekBody(Long.MAX_VALUE).string() } catch (e: Exception) { "" }
             if (!body.contains("cf-challenge-running", true)) {
                 return response
             }
@@ -172,7 +171,9 @@ class Koharu(
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         databaseEnabled = true
+                        // FIX: Use Elvis operator to provide a fallback UA and fix build error
                         userAgentString = originalRequest.header("User-Agent")
+                            ?: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
                     }
                     CookieManager.getInstance().setAcceptCookie(true)
 
@@ -181,14 +182,13 @@ class Koharu(
                 }
 
                 // Polling for the cookie
-                for (i in 1..30) { // Poll for up to 30 seconds
+                for (i in 1..30) {
                     Thread.sleep(1000)
                     val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
                     if (cookies != null && "cf_clearance" in cookies) {
                         val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
                         if (clearanceCookie != null) {
                             val token = clearanceCookie.substringAfter("=").trim()
-                            // Save the token to SharedPreferences for persistence
                             preferences.edit().putString(PREF_CF_TOKEN, token).commit()
                             resolved = true
                             latch.countDown()
@@ -198,9 +198,10 @@ class Koharu(
                 }
 
                 if (!resolved) {
-                    latch.countDown() // Release the latch to prevent timeout if cookie not found
+                    latch.countDown()
                 }
-                latch.await(5, TimeUnit.SECONDS) // Short wait to ensure latch is handled
+
+                latch.await(5, TimeUnit.SECONDS)
 
                 handler.post {
                     webView?.stopLoading()
