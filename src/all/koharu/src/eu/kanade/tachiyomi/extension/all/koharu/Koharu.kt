@@ -21,7 +21,7 @@ import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
-import eu.kanade.tachiyomi.network.interceptor.WebViewInterceptor // Import the correct interceptor
+import eu.kanade.tachiyomi.network.interceptor.WebViewInterceptor // <-- FIX: Added missing import
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -99,17 +99,18 @@ class Koharu(
     private val webViewInterceptor by lazy {
         WebViewInterceptor(
             Injekt.get<Application>(),
-            { it.header("Server").equals("cloudflare", ignoreCase = true) },
-            { it.body?.string()?.contains("Verify you are human") == true },
+            // FIX: Explicitly define the `response` parameter for the lambda
+            predicate = { response: Response -> response.header("Server").equals("cloudflare", ignoreCase = true) },
+            // FIX: Explicitly define the `response` parameter for the lambda
+            onChallenge = { response: Response -> response.body?.string()?.contains("Verify you are human") == true },
         )
     }
 
-    override val client: OkHttpClient by lazy {
-        network.client.newBuilder()
-            .addInterceptor(webViewInterceptor)
-            .rateLimit(3)
-            .build()
-    }
+    // FIX: Removed `by lazy` from the client override
+    override val client: OkHttpClient = network.client.newBuilder()
+        .addInterceptor(webViewInterceptor)
+        .rateLimit(3)
+        .build()
 
     private fun getManga(book: Entry) = SManga.create().apply {
         setUrlWithoutDomain("${book.id}/${book.key}")
