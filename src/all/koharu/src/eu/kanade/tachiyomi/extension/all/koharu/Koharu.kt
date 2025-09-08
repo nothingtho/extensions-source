@@ -58,6 +58,8 @@ import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class Koharu(
     override val lang: String = "all",
@@ -151,10 +153,17 @@ class Koharu(
                 return response
             }
 
+            // Use peekBody to check for challenge without consuming the response body
+            val body = response.peekBody(Long.MAX_VALUE).string()
+            if (!body.contains("cf-challenge-running", true)) {
+                return response
+            }
+
             response.close()
             try {
                 var webView: WebView? = null
                 val latch = CountDownLatch(1)
+                var resolved = false
 
                 handler.post {
                     val wv = WebView(Injekt.get<Application>())
@@ -167,40 +176,39 @@ class Koharu(
                     }
                     CookieManager.getInstance().setAcceptCookie(true)
 
-                    wv.webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView?, url: String?) {
-                            Thread {
-                                var resolved = false
-                                for (i in 1..20) { // Poll for 20 seconds
-                                    Thread.sleep(1000)
-                                    val cookies = CookieManager.getInstance().getCookie(url)
-                                    if (cookies != null && "cf_clearance" in cookies) {
-                                        val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
-                                        if (clearanceCookie != null) {
-                                            val token = clearanceCookie.substringAfter("=").trim()
-                                            preferences.edit().putString(PREF_CF_TOKEN, token).commit()
-                                            resolved = true
-                                            latch.countDown()
-                                            break
-                                        }
-                                    }
-                                }
-                                if (!resolved) {
-                                    latch.countDown() // Timeout
-                                }
-                            }.start()
-                        }
-                    }
+                    wv.webViewClient = object : WebViewClient() {}
                     wv.loadUrl(originalRequest.url.toString())
                 }
 
-                if (!latch.await(30, TimeUnit.SECONDS)) { // 30s total timeout
-                    throw IOException("WebView timed out.")
+                // Polling for the cookie
+                for (i in 1..30) { // Poll for up to 30 seconds
+                    Thread.sleep(1000)
+                    val cookies = CookieManager.getInstance().getCookie(originalRequest.url.toString())
+                    if (cookies != null && "cf_clearance" in cookies) {
+                        val clearanceCookie = cookies.split(';').find { it.trim().startsWith("cf_clearance=") }
+                        if (clearanceCookie != null) {
+                            val token = clearanceCookie.substringAfter("=").trim()
+                            // Save the token to SharedPreferences for persistence
+                            preferences.edit().putString(PREF_CF_TOKEN, token).commit()
+                            resolved = true
+                            latch.countDown()
+                            break
+                        }
+                    }
                 }
+
+                if (!resolved) {
+                    latch.countDown() // Release the latch to prevent timeout if cookie not found
+                }
+                latch.await(5, TimeUnit.SECONDS) // Short wait to ensure latch is handled
 
                 handler.post {
                     webView?.stopLoading()
                     webView?.destroy()
+                }
+
+                if (!resolved) {
+                    throw IOException("Failed to solve Cloudflare challenge: cf_clearance cookie not found.")
                 }
             } catch (e: Exception) {
                 throw IOException("Failed to solve Cloudflare challenge. ${e.message}")
