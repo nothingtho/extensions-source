@@ -432,6 +432,7 @@ class Koharu(
 
     override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", headers)
 
+    // CORRECTED LOGIC: Authenticate the image URLs here, before they are passed to the image loader.
     override fun pageListParse(response: Response): List<Page> {
         val mangaData = response.parseAs<MangaData>()
         val urlString = response.request.url.toString()
@@ -440,28 +441,25 @@ class Koharu(
         val (entryId, entryKey) = matches.destructured
         val imagesInfo = getImagesByMangaData(mangaData, entryId, entryKey)
 
+        // If the images are hosted on the API domain, they need the token.
+        // We get it once here and append it to all URLs.
+        val needsToken = imagesInfo.first.base.toHttpUrlOrNull()?.host?.endsWith("schale.network") == true
+        val token = if (needsToken) getOrFetchToken() else null
+
         return imagesInfo.first.entries.mapIndexed { index, image ->
-            Page(index, imageUrl = "${imagesInfo.first.base}/${image.path}?w=${imagesInfo.second}")
+            val imageUrl = "${imagesInfo.first.base}/${image.path}?w=${imagesInfo.second}"
+            val finalUrl = if (token != null) {
+                imageUrl.toHttpUrl().newBuilder().addQueryParameter("crt", token).build().toString()
+            } else {
+                imageUrl
+            }
+            Page(index, imageUrl = finalUrl)
         }
     }
 
-    // CORRECT: This function now builds the image request correctly.
+    // CORRECTED LOGIC: This is now a simple, non-blocking function.
     override fun imageRequest(page: Page): Request {
-        val url = page.imageUrl!!
-        val parsedUrl = url.toHttpUrlOrNull()
-            ?: throw IOException("Invalid image URL")
-
-        // If the image is hosted on the API domain, it needs the crt token.
-        if (parsedUrl.host.endsWith("schale.network")) {
-            val token = getOrFetchToken() // This may throw, which is handled by Tachiyomi.
-            val newUrl = parsedUrl.newBuilder()
-                .addQueryParameter("crt", token)
-                .build()
-            return GET(newUrl.toString(), headers) // Use the source's default headers.
-        }
-
-        // For other domains (like CDNs), no token is needed.
-        return GET(url, headers)
+        return GET(page.imageUrl!!, headers)
     }
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
