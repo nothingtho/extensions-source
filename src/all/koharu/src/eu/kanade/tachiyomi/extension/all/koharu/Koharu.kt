@@ -76,9 +76,9 @@ class Koharu(
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
-    private fun quality() = preferences.getString(PREF_IMAGERES, "1280")!!
+    private fun quality() = preferences.getString(PREF_IMAGERES, "1280") ?: "1280"
     private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
-    private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
+    private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "") ?: ""
 
     private var _domainUrl: String? = null
     private val domainUrl: String
@@ -91,12 +91,13 @@ class Koharu(
     private fun getDomain(): String {
         try {
             val noRedirectClient = network.client.newBuilder().followRedirects(false).build()
-            val host = noRedirectClient.newCall(GET(baseUrl, headers)).execute()
-                .headers["Location"]?.toHttpUrlOrNull()?.host
+            val response = noRedirectClient.newCall(GET(baseUrl, headers)).execute()
+            val location = response.use { it.headers["Location"] }
+            val host = location?.toHttpUrlOrNull()?.host
                 ?: return baseUrl
             return "https://$host"
-        } catch (_: Exception) {
-            return baseUrl
+        } catch (e: Exception) {
+            return baseUrl // Fallback on any error
         }
     }
 
@@ -133,8 +134,8 @@ class Koharu(
         val token = try {
             getOrFetchToken()
         } catch (e: Exception) {
-            clearanceTokenRef.set(null)
-            throw e
+            clearanceTokenRef.set(null) // Clear bad token
+            throw IOException("Failed to get clearance token. Please try again.", e)
         }
 
         val newUrl = originalRequest.url.newBuilder()
@@ -144,9 +145,9 @@ class Koharu(
 
         var response = chain.proceed(requestWithCrt)
 
-        if (response.code == 403) {
+        if (response.code == 403) { // Token likely expired
             response.close()
-            clearanceTokenRef.set(null)
+            clearanceTokenRef.set(null) // Clear expired token
 
             val newToken = getOrFetchToken()
             val retryUrl = originalRequest.url.newBuilder()
@@ -159,7 +160,7 @@ class Koharu(
         return response
     }
 
-    @Throws(Exception::class)
+    @Throws(IOException::class)
     private fun getOrFetchToken(): String {
         clearanceTokenRef.get()?.let { return it }
 
@@ -168,19 +169,18 @@ class Koharu(
 
             toast("Fetching new clearance token...")
             val tokenResponse = try {
-                // CORRECT: Use POST to get the token.
                 client.newCall(POST("$authUrl/clearance", headers)).execute()
             } catch (e: Exception) {
-                // CORRECT: If the automatic fetch fails, tell the user to use WebView.
-                throw Exception("Cloudflare challenge failed. Please open in WebView, solve the puzzle, and then retry.")
+                throw IOException("Cloudflare challenge failed. Please open in WebView, solve the puzzle, and then retry.", e)
             }
 
             tokenResponse.use { resp ->
                 if (!resp.isSuccessful) {
-                    throw Exception("Cloudflare challenge failed. Please open in WebView, solve the puzzle, and then retry.")
+                    throw IOException("Cloudflare challenge failed (${resp.code}). Please open in WebView, solve the puzzle, and then retry.")
                 }
 
-                val body = resp.body.string()
+                val body = resp.body?.string()
+                    ?: throw IOException("Failed to get clearance token: response body is null.")
                 val parsed = try {
                     json.decodeFromString<SchaleToken>(body)
                 } catch (e: Exception) {
@@ -229,7 +229,7 @@ class Koharu(
         }
 
         if (id == null || public_key == null) {
-            throw Exception("No Images Found")
+            throw IOException("No images found for the selected quality.")
         }
 
         val realQuality = when (id) {
@@ -250,10 +250,10 @@ class Koharu(
 
             val terms: MutableList<String> = mutableListOf()
             if (lang != "all") terms += "language:\"^$searchLang$\""
-            val alwaysExcludeTags = alwaysExcludeTags()?.split(",")
-                ?.map { it.trim() }?.filter(String::isNotBlank) ?: emptyList()
-            if (alwaysExcludeTags.isNotEmpty()) {
-                terms += "tag:\"${alwaysExcludeTags.joinToString(",") { "-$it" }}\""
+            val excludedTags = alwaysExcludeTags().split(",")
+                .map { it.trim() }.filter(String::isNotBlank)
+            if (excludedTags.isNotEmpty()) {
+                terms += "tag:\"${excludedTags.joinToString(",") { "-$it" }}\""
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
@@ -269,10 +269,10 @@ class Koharu(
 
             val terms: MutableList<String> = mutableListOf()
             if (lang != "all") terms += "language:\"^$searchLang$\""
-            val alwaysExcludeTags = alwaysExcludeTags()?.split(",")
-                ?.map { it.trim() }?.filter(String::isNotBlank) ?: emptyList()
-            if (alwaysExcludeTags.isNotEmpty()) {
-                terms += "tag:\"${alwaysExcludeTags.joinToString(",") { "-$it" }}\""
+            val excludedTags = alwaysExcludeTags().split(",")
+                .map { it.trim() }.filter(String::isNotBlank)
+            if (excludedTags.isNotEmpty()) {
+                terms += "tag:\"${excludedTags.joinToString(",") { "-$it" }}\""
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
@@ -280,19 +280,22 @@ class Koharu(
     )
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val data = response.parseAs<Books>()
-        return MangasPage(data.entries.map(::getManga), data.page * data.limit < data.total)
+        return try {
+            val data = response.parseAs<Books>()
+            MangasPage(data.entries.map(::getManga), data.page * data.limit < data.total)
+        } catch (e: Exception) {
+            MangasPage(emptyList(), false)
+        }
     }
 
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        return when {
-            query.startsWith(PREFIX_ID_KEY_SEARCH) -> {
-                val ipk = query.removePrefix(PREFIX_ID_KEY_SEARCH)
-                client.newCall(GET("$apiBooksUrl/detail/$ipk", headers))
-                    .asObservableSuccess()
-                    .map { MangasPage(listOf(mangaDetailsParse(it)), false) }
-            }
-            else -> super.fetchSearchManga(page, query, filters)
+        return if (query.startsWith(PREFIX_ID_KEY_SEARCH)) {
+            val ipk = query.removePrefix(PREFIX_ID_KEY_SEARCH)
+            client.newCall(GET("$apiBooksUrl/detail/$ipk", headers))
+                .asObservableSuccess()
+                .map { MangasPage(listOf(mangaDetailsParse(it)), false) }
+        } else {
+            super.fetchSearchManga(page, query, filters)
         }
     }
 
@@ -303,10 +306,10 @@ class Koharu(
             val excludedTags: MutableList<Int> = mutableListOf()
 
             if (lang != "all") terms += "language:\"^$searchLang$\""
-            val alwaysExcludeTags = alwaysExcludeTags()?.split(",")
-                ?.map { it.trim() }?.filter(String::isNotBlank) ?: emptyList()
-            if (alwaysExcludeTags.isNotEmpty()) {
-                terms += "tag:\"${alwaysExcludeTags.joinToString(",") { "-$it" }}\""
+            val alwaysExcluded = alwaysExcludeTags().split(",")
+                .map { it.trim() }.filter(String::isNotBlank)
+            if (alwaysExcluded.isNotEmpty()) {
+                terms += "tag:\"${alwaysExcluded.joinToString(",") { "-$it" }}\""
             }
 
             filters.forEach { filter ->
@@ -392,6 +395,7 @@ class Koharu(
                         otherList = tags.filterIsInstance<KoharuFilters.Other>()
                     }
             } catch (_: Exception) {
+                // Do nothing, will retry next time
             } finally {
                 tagsFetchAttempts++
             }
@@ -401,10 +405,14 @@ class Koharu(
     override fun mangaDetailsRequest(manga: SManga) = GET("$apiBooksUrl/detail/${manga.url}", headers)
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val mangaDetail = response.parseAs<MangaDetail>()
-        return mangaDetail.toSManga().apply {
-            setUrlWithoutDomain("${mangaDetail.id}/${mangaDetail.key}")
-            title = if (remadd()) mangaDetail.title.shortenTitle() else mangaDetail.title
+        try {
+            val mangaDetail = response.parseAs<MangaDetail>()
+            return mangaDetail.toSManga().apply {
+                setUrlWithoutDomain("${mangaDetail.id}/${mangaDetail.key}")
+                title = if (remadd()) mangaDetail.title.shortenTitle() else mangaDetail.title
+            }
+        } catch (e: Exception) {
+            throw IOException("Failed to parse manga details. The entry may have been removed.", e)
         }
     }
 
@@ -413,14 +421,19 @@ class Koharu(
     override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", headers)
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val manga = response.parseAs<MangaDetail>()
-        return listOf(
-            SChapter.create().apply {
-                name = "Chapter"
-                url = "${manga.id}/${manga.key}"
-                date_upload = (manga.updated_at ?: manga.created_at)
-            },
-        )
+        return try {
+            val manga = response.parseAs<MangaDetail>()
+            listOf(
+                SChapter.create().apply {
+                    name = "Chapter"
+                    url = "${manga.id}/${manga.key}"
+                    date_upload = (manga.updated_at ?: manga.created_at)
+                },
+            )
+        } catch (e: Exception) {
+            // If details fail, there are no chapters. Return empty to avoid a crash.
+            emptyList()
+        }
     }
 
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
@@ -434,29 +447,34 @@ class Koharu(
     override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
-        val mangaData = response.parseAs<MangaData>()
-        val urlString = response.request.url.toString()
-        val matches = Regex("""/detail/(\d+)/([a-z\d]+)""").find(urlString)
-            ?: throw IOException("Failed to parse URL: $urlString")
-        val (entryId, entryKey) = matches.destructured
-        val imagesInfo = getImagesByMangaData(mangaData, entryId, entryKey)
+        try {
+            val mangaData = response.parseAs<MangaData>()
+            val urlString = response.request.url.toString()
+            val matches = Regex("""/detail/(\d+)/([a-z\d]+)""").find(urlString)
+                ?: throw IOException("Failed to parse manga ID and key from URL: $urlString")
+            val (entryId, entryKey) = matches.destructured
+            val (imagesInfo, quality) = getImagesByMangaData(mangaData, entryId, entryKey)
 
-        val needsToken = imagesInfo.first.base.toHttpUrlOrNull()?.host?.endsWith("schale.network") == true
-        val token = if (needsToken) getOrFetchToken() else null
+            val needsToken = imagesInfo.base.toHttpUrlOrNull()?.host?.endsWith("schale.network") == true
+            val token = if (needsToken) getOrFetchToken() else null
 
-        return imagesInfo.first.entries.mapIndexed { index, image ->
-            val imageUrl = "${imagesInfo.first.base}/${image.path}?w=${imagesInfo.second}"
-            val finalUrl = if (token != null) {
-                imageUrl.toHttpUrl().newBuilder().addQueryParameter("crt", token).build().toString()
-            } else {
-                imageUrl
+            return imagesInfo.entries.mapIndexed { index, image ->
+                val imageUrl = "${imagesInfo.base}/${image.path}?w=$quality"
+                val finalUrl = if (token != null) {
+                    imageUrl.toHttpUrl().newBuilder().addQueryParameter("crt", token).build().toString()
+                } else {
+                    imageUrl
+                }
+                Page(index, imageUrl = finalUrl)
             }
-            Page(index, imageUrl = finalUrl)
+        } catch (e: Exception) {
+            throw IOException("Failed to parse page list. It might be a premium chapter or an issue with the source.", e)
         }
     }
 
     override fun imageRequest(page: Page): Request {
-        return GET(page.imageUrl!!, headers)
+        val imageUrl = page.imageUrl ?: throw IOException("Image URL is null for page #${page.index + 1}")
+        return GET(imageUrl, headers)
     }
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
@@ -489,7 +507,17 @@ class Koharu(
         addRandomUAPreferenceToScreen(screen)
     }
 
-    private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
+    private inline fun <reified T> Response.parseAs(): T {
+        val responseBody = use { it.body?.string() }
+        if (responseBody.isNullOrEmpty()) {
+            throw IOException("Response body is null or empty")
+        }
+        try {
+            return json.decodeFromString(responseBody)
+        } catch (e: Exception) {
+            throw IOException("Failed to parse JSON: \n$responseBody", e)
+        }
+    }
 
     companion object {
         const val PREFIX_ID_KEY_SEARCH = "id:"
