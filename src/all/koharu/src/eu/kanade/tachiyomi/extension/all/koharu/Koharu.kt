@@ -133,9 +133,8 @@ class Koharu(
 
         val token = try {
             getOrFetchToken()
-        } catch (e: IOException) {
+        } catch (e: Exception) {
             clearanceTokenRef.set(null)
-            // Re-throw the specific WebView exception from the token fetcher
             throw e
         }
 
@@ -148,9 +147,9 @@ class Koharu(
 
         if (response.code == 403) {
             response.close()
-            clearanceTokenRef.set(null) // Invalidate token
+            clearanceTokenRef.set(null)
 
-            val newToken = getOrFetchToken() // Re-fetch
+            val newToken = getOrFetchToken()
             val retryUrl = originalRequest.url.newBuilder()
                 .addQueryParameter("crt", newToken)
                 .build()
@@ -172,7 +171,6 @@ class Koharu(
             val tokenResponse = try {
                 client.newCall(POST("$authUrl/clearance", headers)).execute()
             } catch (e: Exception) {
-                // CORRECT: This is where the automatic fetch fails. We tell the user to use WebView.
                 throw Exception("Cloudflare challenge failed. Please open in WebView, solve the puzzle, and then retry.")
             }
 
@@ -447,17 +445,23 @@ class Koharu(
         }
     }
 
+    // CORRECT: This function now builds the image request correctly.
     override fun imageRequest(page: Page): Request {
         val url = page.imageUrl!!
-        val parsedUrl = url.toHttpUrl()
+        val parsedUrl = url.toHttpUrlOrNull()
+            ?: throw IOException("Invalid image URL")
 
-        val clientToUse = if (parsedUrl.host.endsWith("schale.network")) {
-            pageClient
-        } else {
-            this.client
+        // If the image is hosted on the API domain, it needs the crt token.
+        if (parsedUrl.host.endsWith("schale.network")) {
+            val token = getOrFetchToken() // This may throw, which is handled by Tachiyomi.
+            val newUrl = parsedUrl.newBuilder()
+                .addQueryParameter("crt", token)
+                .build()
+            return GET(newUrl.toString(), headers) // Use the source's default headers.
         }
 
-        return GET(url, clientToUse.headers)
+        // For other domains (like CDNs), no token is needed.
+        return GET(url, headers)
     }
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
