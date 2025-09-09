@@ -64,7 +64,6 @@ class Koharu(
 
     override val name = "Niyaniya"
     override val baseUrl = "https://niyaniya.moe"
-
     override val id = if (lang == "en") 1484902275639232927 else super.id
     private val apiUrl = "https://api.schale.network"
     private val authUrl = "https://auth.schale.network"
@@ -169,8 +168,10 @@ class Koharu(
 
             toast("Fetching new clearance token...")
             val tokenResponse = try {
+                // CORRECT: Use POST to get the token.
                 client.newCall(POST("$authUrl/clearance", headers)).execute()
             } catch (e: Exception) {
+                // CORRECT: If the automatic fetch fails, tell the user to use WebView.
                 throw Exception("Cloudflare challenge failed. Please open in WebView, solve the puzzle, and then retry.")
             }
 
@@ -432,7 +433,6 @@ class Koharu(
 
     override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", headers)
 
-    // CORRECTED LOGIC: Authenticate the image URLs here, before they are passed to the image loader.
     override fun pageListParse(response: Response): List<Page> {
         val mangaData = response.parseAs<MangaData>()
         val urlString = response.request.url.toString()
@@ -441,8 +441,6 @@ class Koharu(
         val (entryId, entryKey) = matches.destructured
         val imagesInfo = getImagesByMangaData(mangaData, entryId, entryKey)
 
-        // If the images are hosted on the API domain, they need the token.
-        // We get it once here and append it to all URLs.
         val needsToken = imagesInfo.first.base.toHttpUrlOrNull()?.host?.endsWith("schale.network") == true
         val token = if (needsToken) getOrFetchToken() else null
 
@@ -457,7 +455,6 @@ class Koharu(
         }
     }
 
-    // CORRECTED LOGIC: This is now a simple, non-blocking function.
     override fun imageRequest(page: Page): Request {
         return GET(page.imageUrl!!, headers)
     }
