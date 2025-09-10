@@ -1,9 +1,13 @@
 package eu.kanade.tachiyomi.extension.all.koharu
 
+import android.annotation.SuppressLint
 import android.app.Application
 import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
@@ -42,6 +46,7 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
@@ -55,6 +60,8 @@ import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 class Koharu(
@@ -76,9 +83,9 @@ class Koharu(
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
-    private fun quality() = preferences.getString(PREF_IMAGERES, "1280") ?: "1280"
+    private fun quality() = preferences.getString(PREF_IMAGERES, "1280")!!
     private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
-    private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "") ?: ""
+    private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
 
     private var _domainUrl: String? = null
     private val domainUrl: String
@@ -91,17 +98,16 @@ class Koharu(
     private fun getDomain(): String {
         try {
             val noRedirectClient = network.client.newBuilder().followRedirects(false).build()
-            val response = noRedirectClient.newCall(GET(baseUrl, headers)).execute()
-            val location = response.use { it.headers["Location"] }
-            val host = location?.toHttpUrlOrNull()?.host
+            val host = noRedirectClient.newCall(GET(baseUrl, Headers.Builder().build())).execute()
+                .headers["Location"]?.toHttpUrlOrNull()?.host
                 ?: return baseUrl
             return "https://$host"
-        } catch (e: Exception) {
-            return baseUrl // Fallback on any error
+        } catch (_: Exception) {
+            return baseUrl
         }
     }
 
-    override fun headersBuilder() = super.headersBuilder()
+    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .set("Referer", "$domainUrl/")
         .set("Origin", domainUrl)
 
@@ -125,35 +131,44 @@ class Koharu(
     private val clearanceTokenRef = AtomicReference<String?>(null)
     private val tokenLock = Any()
 
-    @Serializable
-    private data class SchaleToken(val token: String)
+    @Serializable private data class SchaleToken(val token: String)
+    @Serializable private data class SchaleError(val error: String)
 
     private fun schaleTokenInterceptor(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
 
-        val token = try {
-            getOrFetchToken()
-        } catch (e: Exception) {
-            clearanceTokenRef.set(null) // Clear bad token
-            throw IOException("Failed to get clearance token. Please try again.", e)
+        // If the URL already contains a 'crt' param, don't add another.
+        if (originalRequest.url.queryParameter("crt") != null) {
+            return chain.proceed(originalRequest)
         }
 
-        val newUrl = originalRequest.url.newBuilder()
-            .addQueryParameter("crt", token)
+        val token = try {
+            getOrFetchToken(originalRequest)
+        } catch (e: IOException) {
+            handler.post { Toast.makeText(Injekt.get<Application>(), "Clearance Error: ${e.message}", Toast.LENGTH_LONG).show() }
+            throw e
+        }
+
+        val requestWithCrt = originalRequest.newBuilder()
+            .url(originalRequest.url.newBuilder().addQueryParameter("crt", token).build())
             .build()
-        val requestWithCrt = originalRequest.newBuilder().url(newUrl).build()
 
         var response = chain.proceed(requestWithCrt)
 
-        if (response.code == 403) { // Token likely expired
+        if (response.code in listOf(401, 403)) {
             response.close()
-            clearanceTokenRef.set(null) // Clear expired token
+            clearanceTokenRef.set(null) // Invalidate token
 
-            val newToken = getOrFetchToken()
-            val retryUrl = originalRequest.url.newBuilder()
-                .addQueryParameter("crt", newToken)
+            val newToken = try {
+                getOrFetchToken(originalRequest) // Fetch a new one
+            } catch (e: IOException) {
+                throw e
+            }
+
+            val retryRequest = originalRequest.newBuilder()
+                .url(originalRequest.url.newBuilder().addQueryParameter("crt", newToken).build())
                 .build()
-            val retryRequest = originalRequest.newBuilder().url(retryUrl).build()
+
             response = chain.proceed(retryRequest)
         }
 
@@ -161,35 +176,33 @@ class Koharu(
     }
 
     @Throws(IOException::class)
-    private fun getOrFetchToken(): String {
+    private fun getOrFetchToken(originalRequest: Request): String {
         clearanceTokenRef.get()?.let { return it }
 
         synchronized(tokenLock) {
             clearanceTokenRef.get()?.let { return it }
 
-            toast("Fetching new clearance token...")
-            val tokenResponse = try {
-                client.newCall(POST("$authUrl/clearance", headers)).execute()
+            toast("Schale requires clearance. Solving challenge...")
+            try {
+                val turnstileToken = ClearanceWebView(originalRequest).solve()
+                val clearanceRequest = POST("$authUrl/clearance", headers, body = okhttp3.RequestBody.create(null, ByteArray(0)))
+                    .newBuilder()
+                    .header("Authorization", "Bearer $turnstileToken")
+                    .build()
+
+                val clearanceResponse = client.newCall(clearanceRequest).execute()
+                if (!clearanceResponse.isSuccessful) {
+                    val errorBody = clearanceResponse.body?.string().orEmpty()
+                    val errorMsg = try { json.decodeFromString<SchaleError>(errorBody).error } catch (_: Exception) { errorBody }
+                    throw IOException("Failed to exchange Turnstile token. Server said: $errorMsg (HTTP ${clearanceResponse.code})")
+                }
+
+                val body = clearanceResponse.body?.string() ?: throw IOException("Clearance response is empty.")
+                val schaleToken = json.decodeFromString<SchaleToken>(body).token
+                clearanceTokenRef.set(schaleToken)
+                return schaleToken
             } catch (e: Exception) {
-                throw IOException("Cloudflare challenge failed. Please open in WebView, solve the puzzle, and then retry.", e)
-            }
-
-            tokenResponse.use { resp ->
-                if (!resp.isSuccessful) {
-                    throw IOException("Cloudflare challenge failed (${resp.code}). Please open in WebView, solve the puzzle, and then retry.")
-                }
-
-                val body = resp.body?.string()
-                    ?: throw IOException("Failed to get clearance token: response body is null.")
-                val parsed = try {
-                    json.decodeFromString<SchaleToken>(body)
-                } catch (e: Exception) {
-                    throw IOException("Failed to parse clearance token from response.", e)
-                }
-
-                val newToken = parsed.token
-                clearanceTokenRef.set(newToken)
-                return newToken
+                throw IOException("Failed to solve clearance challenge: ${e.message}", e)
             }
         }
     }
@@ -200,9 +213,93 @@ class Koharu(
         }
     }
 
+    private inner class ClearanceWebView(private val request: Request) {
+        private val latch = CountDownLatch(1)
+        private var turnstileToken: String? = null
+
+        private val jsToInject = """
+            (function() {
+                if (window.turnstileCallbackInjected) return;
+                window.turnstileCallbackInjected = true;
+
+                const originalRender = window.turnstile.render;
+                window.turnstile.render = function(container, params) {
+                    const originalCallback = params.callback;
+                    params.callback = function(token) {
+                        JSInterface.receiveToken(token);
+                        if (originalCallback) {
+                            originalCallback(token);
+                        }
+                    };
+                    return originalRender(container, params);
+                };
+
+                // In case render was already called
+                document.querySelectorAll('.cf-turnstile').forEach(el => {
+                    const widgetId = el.dataset.widgetId;
+                    if (widgetId && window.turnstile.getResponse(widgetId)) {
+                         JSInterface.receiveToken(window.turnstile.getResponse(widgetId));
+                    }
+                });
+            })();
+        """.trimIndent()
+
+        private val checkJs = "setInterval(() => { if(window.turnstile) { $jsToInject } }, 100);"
+
+        @SuppressLint("SetJavaScriptEnabled")
+        fun solve(): String {
+            var webView: WebView? = null
+
+            val userAgent = request.header("User-Agent")
+                ?: preferences.getPrefCustomUA()?.takeIf { it.isNotBlank() }
+                ?: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+
+            handler.post {
+                val wv = WebView(Injekt.get<Application>())
+                webView = wv
+                wv.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    userAgentString = userAgent
+                }
+                wv.addJavascriptInterface(JsCallback(), "JSInterface")
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String) {
+                        view.evaluateJavascript(checkJs, null)
+                    }
+                }
+                wv.loadUrl(request.url.toString())
+            }
+
+            latch.await(45, TimeUnit.SECONDS)
+
+            handler.post {
+                webView?.stopLoading()
+                webView?.destroy()
+            }
+
+            return turnstileToken ?: throw IOException("Could not solve Turnstile challenge.")
+        }
+
+        inner class JsCallback {
+            @JavascriptInterface
+            fun receiveToken(token: String) {
+                if (turnstileToken == null) {
+                    turnstileToken = token
+                    latch.countDown()
+                }
+            }
+        }
+    }
+
     private fun getManga(book: Entry) = SManga.create().apply {
         setUrlWithoutDomain("${book.id}/${book.key}")
-        title = if (remadd()) book.title.shortenTitle() else book.title
+        title = if (remadd()) {
+            book.title.shortenTitle()
+        } else {
+            book.title
+        }
         thumbnail_url = book.thumbnail.path
     }
 
@@ -229,7 +326,7 @@ class Koharu(
         }
 
         if (id == null || public_key == null) {
-            throw IOException("No images found for the selected quality.")
+            throw Exception("No Images Found")
         }
 
         val realQuality = when (id) {
@@ -247,15 +344,16 @@ class Koharu(
     override fun latestUpdatesRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
-
             val terms: MutableList<String> = mutableListOf()
-            if (lang != "all") terms += "language:\"^$searchLang$\""
-            val excludedTags = alwaysExcludeTags().split(",")
-                .map { it.trim() }.filter(String::isNotBlank)
-            if (excludedTags.isNotEmpty()) {
-                terms += "tag:\"${excludedTags.joinToString(",") { "-$it" }}\""
+            if (lang != "all") {
+                terms += "language:\"^$searchLang$\""
             }
-            if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
+            alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
+                terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
+            }
+            if (terms.isNotEmpty()) {
+                addQueryParameter("s", terms.joinToString(" "))
+            }
         }.build(),
         headers,
     )
@@ -266,26 +364,23 @@ class Koharu(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
             addQueryParameter("sort", "8")
             addQueryParameter("page", page.toString())
-
             val terms: MutableList<String> = mutableListOf()
-            if (lang != "all") terms += "language:\"^$searchLang$\""
-            val excludedTags = alwaysExcludeTags().split(",")
-                .map { it.trim() }.filter(String::isNotBlank)
-            if (excludedTags.isNotEmpty()) {
-                terms += "tag:\"${excludedTags.joinToString(",") { "-$it" }}\""
+            if (lang != "all") {
+                terms += "language:\"^$searchLang$\""
             }
-            if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
+            alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
+                terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
+            }
+            if (terms.isNotEmpty()) {
+                addQueryParameter("s", terms.joinToString(" "))
+            }
         }.build(),
         headers,
     )
 
     override fun popularMangaParse(response: Response): MangasPage {
-        return try {
-            val data = response.parseAs<Books>()
-            MangasPage(data.entries.map(::getManga), data.page * data.limit < data.total)
-        } catch (e: Exception) {
-            MangasPage(emptyList(), false)
-        }
+        val data = response.parseAs<Books>()
+        return MangasPage(data.entries.map(::getManga), data.page * data.limit < data.total)
     }
 
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
@@ -304,64 +399,50 @@ class Koharu(
             val terms: MutableList<String> = mutableListOf()
             val includedTags: MutableList<Int> = mutableListOf()
             val excludedTags: MutableList<Int> = mutableListOf()
-
-            if (lang != "all") terms += "language:\"^$searchLang$\""
-            val alwaysExcluded = alwaysExcludeTags().split(",")
-                .map { it.trim() }.filter(String::isNotBlank)
-            if (alwaysExcluded.isNotEmpty()) {
-                terms += "tag:\"${alwaysExcluded.joinToString(",") { "-$it" }}\""
+            if (lang != "all") {
+                terms += "language:\"^$searchLang$\""
             }
-
+            alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
+                terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
+            }
             filters.forEach { filter ->
                 when (filter) {
                     is KoharuFilters.SortFilter -> addQueryParameter("sort", filter.getValue())
-
-                    is KoharuFilters.CategoryFilter -> {
-                        val activeFilter = filter.state.filter { it.state }
-                        if (activeFilter.isNotEmpty()) {
-                            addQueryParameter("cat", activeFilter.sumOf { it.value }.toString())
+                    is KoharuFilters.CategoryFilter -> filter.state.filter { it.state }.let {
+                        if (it.isNotEmpty()) {
+                            addQueryParameter("cat", it.sumOf { tag -> tag.value }.toString())
                         }
                     }
-
                     is KoharuFilters.TagFilter -> {
-                        includedTags += filter.state
-                            .filter { it.isIncluded() }
-                            .map { it.id }
-                        excludedTags += filter.state
-                            .filter { it.isExcluded() }
-                            .map { it.id }
+                        includedTags += filter.state.filter { it.isIncluded() }.map { it.id }
+                        excludedTags += filter.state.filter { it.isExcluded() }.map { it.id }
                     }
-
-                    is KoharuFilters.GenreConditionFilter -> {
-                        if (filter.state > 0) {
-                            addQueryParameter(filter.param, filter.toUriPart())
-                        }
+                    is KoharuFilters.GenreConditionFilter -> if (filter.state > 0) {
+                        addQueryParameter(filter.param, filter.toUriPart())
                     }
-
-                    is KoharuFilters.TextFilter -> {
-                        if (filter.state.isNotEmpty()) {
-                            val tags = filter.state.split(",").filter(String::isNotBlank).joinToString(",")
-                            if (tags.isNotBlank()) {
-                                terms += "${filter.type}:" + if (filter.type == "pages") tags else "\"$tags\""
-                            }
+                    is KoharuFilters.TextFilter -> filter.state.takeIf { it.isNotEmpty() }?.let {
+                        val tags = it.split(",").filter(String::isNotBlank).joinToString(",")
+                        if (tags.isNotBlank()) {
+                            terms += "${filter.type}:${if (filter.type == "pages") tags else "\"$tags\""}"
                         }
                     }
                     else -> {}
                 }
             }
-
             if (includedTags.isNotEmpty()) {
                 addQueryParameter("include", includedTags.joinToString(","))
             }
             if (excludedTags.isNotEmpty()) {
                 addQueryParameter("exclude", excludedTags.joinToString(","))
             }
-
-            if (query.isNotEmpty()) terms.add("title:\"$query\"")
-            if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
+            if (query.isNotEmpty()) {
+                terms.add("title:\"$query\"")
+            }
+            if (terms.isNotEmpty()) {
+                addQueryParameter("s", terms.joinToString(" "))
+            }
             addQueryParameter("page", page.toString())
         }.build()
-
         return GET(url, headers)
     }
 
@@ -395,7 +476,6 @@ class Koharu(
                         otherList = tags.filterIsInstance<KoharuFilters.Other>()
                     }
             } catch (_: Exception) {
-                // Do nothing, will retry next time
             } finally {
                 tagsFetchAttempts++
             }
@@ -405,14 +485,14 @@ class Koharu(
     override fun mangaDetailsRequest(manga: SManga) = GET("$apiBooksUrl/detail/${manga.url}", headers)
 
     override fun mangaDetailsParse(response: Response): SManga {
-        try {
-            val mangaDetail = response.parseAs<MangaDetail>()
-            return mangaDetail.toSManga().apply {
-                setUrlWithoutDomain("${mangaDetail.id}/${mangaDetail.key}")
-                title = if (remadd()) mangaDetail.title.shortenTitle() else mangaDetail.title
+        val mangaDetail = response.parseAs<MangaDetail>()
+        return mangaDetail.toSManga().apply {
+            setUrlWithoutDomain("${mangaDetail.id}/${mangaDetail.key}")
+            title = if (remadd()) {
+                mangaDetail.title.shortenTitle()
+            } else {
+                mangaDetail.title
             }
-        } catch (e: Exception) {
-            throw IOException("Failed to parse manga details. The entry may have been removed.", e)
         }
     }
 
@@ -421,19 +501,14 @@ class Koharu(
     override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", headers)
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        return try {
-            val manga = response.parseAs<MangaDetail>()
-            listOf(
-                SChapter.create().apply {
-                    name = "Chapter"
-                    url = "${manga.id}/${manga.key}"
-                    date_upload = (manga.updated_at ?: manga.created_at)
-                },
-            )
-        } catch (e: Exception) {
-            // If details fail, there are no chapters. Return empty to avoid a crash.
-            emptyList()
-        }
+        val manga = response.parseAs<MangaDetail>()
+        return listOf(
+            SChapter.create().apply {
+                name = "Chapter"
+                url = "${manga.id}/${manga.key}"
+                date_upload = (manga.updated_at ?: manga.created_at)
+            },
+        )
     }
 
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
@@ -447,34 +522,16 @@ class Koharu(
     override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
-        try {
-            val mangaData = response.parseAs<MangaData>()
-            val urlString = response.request.url.toString()
-            val matches = Regex("""/detail/(\d+)/([a-z\d]+)""").find(urlString)
-                ?: throw IOException("Failed to parse manga ID and key from URL: $urlString")
-            val (entryId, entryKey) = matches.destructured
-            val (imagesInfo, quality) = getImagesByMangaData(mangaData, entryId, entryKey)
+        val mangaData = response.parseAs<MangaData>()
+        val urlString = response.request.url.toString()
+        val matches = Regex("""/detail/(\d+)/([a-z\d]+)""").find(urlString)
+            ?: throw IOException("Failed to parse URL: $urlString")
+        val (entryId, entryKey) = matches.destructured
+        val imagesInfo = getImagesByMangaData(mangaData, entryId, entryKey)
 
-            val needsToken = imagesInfo.base.toHttpUrlOrNull()?.host?.endsWith("schale.network") == true
-            val token = if (needsToken) getOrFetchToken() else null
-
-            return imagesInfo.entries.mapIndexed { index, image ->
-                val imageUrl = "${imagesInfo.base}/${image.path}?w=$quality"
-                val finalUrl = if (token != null) {
-                    imageUrl.toHttpUrl().newBuilder().addQueryParameter("crt", token).build().toString()
-                } else {
-                    imageUrl
-                }
-                Page(index, imageUrl = finalUrl)
-            }
-        } catch (e: Exception) {
-            throw IOException("Failed to parse page list. It might be a premium chapter or an issue with the source.", e)
+        return imagesInfo.first.entries.mapIndexed { index, image ->
+            Page(index, imageUrl = "${imagesInfo.first.base}/${image.path}?w=${imagesInfo.second}")
         }
-    }
-
-    override fun imageRequest(page: Page): Request {
-        val imageUrl = page.imageUrl ?: throw IOException("Image URL is null for page #${page.index + 1}")
-        return GET(imageUrl, headers)
     }
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
@@ -507,24 +564,13 @@ class Koharu(
         addRandomUAPreferenceToScreen(screen)
     }
 
-    private inline fun <reified T> Response.parseAs(): T {
-        val responseBody = use { it.body?.string() }
-        if (responseBody.isNullOrEmpty()) {
-            throw IOException("Response body is null or empty")
-        }
-        try {
-            return json.decodeFromString(responseBody)
-        } catch (e: Exception) {
-            throw IOException("Failed to parse JSON: \n$responseBody", e)
-        }
-    }
+    private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
 
     companion object {
         const val PREFIX_ID_KEY_SEARCH = "id:"
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
-
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
     }
 }
