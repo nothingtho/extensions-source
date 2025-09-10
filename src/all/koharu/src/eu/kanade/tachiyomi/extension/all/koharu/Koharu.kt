@@ -45,6 +45,8 @@ import okhttp3.Response
 import rx.Observable
 import uy.kohesive.injekt.injectLazy
 import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 // This is a temporary helper object for debugging Cloudflare clearance.
 // Its only purpose is to verify if the cf_clearance cookie is being
@@ -64,7 +66,8 @@ object CloudflareHelper {
         Log.d(TAG, "======================================================================")
 
         val client = source.client
-        val headers = source.headersBuilder().build()
+        // Correctly access public headers property, not the protected builder method
+        val headers = source.headers
 
         try {
             Log.d(TAG, "Attempting to connect to baseUrl to check for Cloudflare block...")
@@ -163,14 +166,6 @@ class Koharu(
                 filterInclude = listOf("chrome"),
             )
             .rateLimit(3)
-            .build()
-    }
-
-    // This is a placeholder for the future client that will handle authenticated requests.
-    // For now, it's the same as the main client.
-    private val pageClient: OkHttpClient by lazy {
-        client.newBuilder()
-            // .addInterceptor(::schaleTokenInterceptor) // The real interceptor will be added back later
             .build()
     }
 
@@ -362,9 +357,8 @@ class Koharu(
 
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
 
-    // For now, this is a placeholder. Page loading will fail until we implement the 'crt' token logic.
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return Observable.error(UnsupportedOperationException("Page loading requires solving the 'crt' token challenge, which is the next step."))
+        return Observable.error(UnsupportedOperationException("Page loading is disabled in this debug build."))
     }
 
     override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException()
@@ -399,6 +393,7 @@ class Koharu(
         addRandomUAPreferenceToScreen(screen)
     }
 
+    // Corrected parseAs function
     private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
 
     companion object {
@@ -406,6 +401,7 @@ class Koharu(
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
+        // Added missing imports
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
     }
 }
