@@ -51,7 +51,6 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import rx.Observable
@@ -193,6 +192,7 @@ class Koharu(
                     .header("Authorization", "Bearer $turnstileToken")
                     .build()
 
+                // Use the main client, which has the cf_clearance cookie from manual solving
                 val clearanceResponse = client.newCall(clearanceRequest).execute()
                 if (!clearanceResponse.isSuccessful) {
                     val errorBody = clearanceResponse.body.string().orEmpty()
@@ -242,7 +242,6 @@ class Koharu(
         @SuppressLint("SetJavaScriptEnabled")
         fun solve(): String {
             var webView: WebView? = null
-
             val userAgent = client.newCall(GET(baseUrl, headers)).execute().request.header("User-Agent")!!
 
             handler.post {
@@ -253,6 +252,8 @@ class Koharu(
                     domStorageEnabled = true
                     databaseEnabled = true
                     userAgentString = userAgent
+                    loadWithOverviewMode = true
+                    useWideViewPort = true
                 }
                 wv.addJavascriptInterface(JsCallback(), "JSInterface")
                 wv.webViewClient = object : WebViewClient() {
@@ -260,7 +261,6 @@ class Koharu(
                         view.evaluateJavascript(checkJs, null)
                     }
                 }
-                // Load a page that is guaranteed to have the Turnstile widget
                 wv.loadUrl("$authUrl/login")
             }
 
