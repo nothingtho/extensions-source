@@ -52,6 +52,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import rx.Observable
 import uy.kohesive.injekt.Injekt
@@ -137,14 +138,13 @@ class Koharu(
     private fun schaleTokenInterceptor(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
 
-        // If the URL already contains a 'crt' param, don't add another.
         if (originalRequest.url.queryParameter("crt") != null) {
             return chain.proceed(originalRequest)
         }
 
         val token = try {
-            getOrFetchToken(originalRequest)
-        } catch (e: IOException) {
+            getOrFetchToken()
+        } catch (e: Exception) {
             handler.post { Toast.makeText(Injekt.get<Application>(), "Clearance Error: ${e.message}", Toast.LENGTH_LONG).show() }
             throw e
         }
@@ -157,10 +157,10 @@ class Koharu(
 
         if (response.code in listOf(401, 403)) {
             response.close()
-            clearanceTokenRef.set(null) // Invalidate token
+            clearanceTokenRef.set(null)
 
             val newToken = try {
-                getOrFetchToken(originalRequest) // Fetch a new one
+                getOrFetchToken()
             } catch (e: IOException) {
                 throw e
             }
@@ -176,7 +176,7 @@ class Koharu(
     }
 
     @Throws(IOException::class)
-    private fun getOrFetchToken(originalRequest: Request): String {
+    private fun getOrFetchToken(): String {
         clearanceTokenRef.get()?.let { return it }
 
         synchronized(tokenLock) {
@@ -184,22 +184,26 @@ class Koharu(
 
             toast("Schale requires clearance. Solving challenge...")
             try {
-                val turnstileToken = ClearanceWebView(originalRequest).solve()
-                val clearanceRequest = POST("$authUrl/clearance", headers, body = okhttp3.RequestBody.create(null, ByteArray(0)))
-                    .newBuilder()
+                val turnstileToken = ClearanceWebView().solve()
+                val clearanceRequest = POST(
+                    "$authUrl/clearance",
+                    headers,
+                    body = "".toRequestBody(null),
+                ).newBuilder()
                     .header("Authorization", "Bearer $turnstileToken")
                     .build()
 
                 val clearanceResponse = client.newCall(clearanceRequest).execute()
                 if (!clearanceResponse.isSuccessful) {
-                    val errorBody = clearanceResponse.body?.string().orEmpty()
+                    val errorBody = clearanceResponse.body.string().orEmpty()
                     val errorMsg = try { json.decodeFromString<SchaleError>(errorBody).error } catch (_: Exception) { errorBody }
                     throw IOException("Failed to exchange Turnstile token. Server said: $errorMsg (HTTP ${clearanceResponse.code})")
                 }
 
-                val body = clearanceResponse.body?.string() ?: throw IOException("Clearance response is empty.")
+                val body = clearanceResponse.body.string()
                 val schaleToken = json.decodeFromString<SchaleToken>(body).token
                 clearanceTokenRef.set(schaleToken)
+                toast("Clearance obtained!")
                 return schaleToken
             } catch (e: Exception) {
                 throw IOException("Failed to solve clearance challenge: ${e.message}", e)
@@ -213,7 +217,7 @@ class Koharu(
         }
     }
 
-    private inner class ClearanceWebView(private val request: Request) {
+    private inner class ClearanceWebView {
         private val latch = CountDownLatch(1)
         private var turnstileToken: String? = null
 
@@ -221,38 +225,25 @@ class Koharu(
             (function() {
                 if (window.turnstileCallbackInjected) return;
                 window.turnstileCallbackInjected = true;
-
                 const originalRender = window.turnstile.render;
                 window.turnstile.render = function(container, params) {
                     const originalCallback = params.callback;
                     params.callback = function(token) {
                         JSInterface.receiveToken(token);
-                        if (originalCallback) {
-                            originalCallback(token);
-                        }
+                        if (originalCallback) originalCallback(token);
                     };
                     return originalRender(container, params);
                 };
-
-                // In case render was already called
-                document.querySelectorAll('.cf-turnstile').forEach(el => {
-                    const widgetId = el.dataset.widgetId;
-                    if (widgetId && window.turnstile.getResponse(widgetId)) {
-                         JSInterface.receiveToken(window.turnstile.getResponse(widgetId));
-                    }
-                });
             })();
         """.trimIndent()
 
-        private val checkJs = "setInterval(() => { if(window.turnstile) { $jsToInject } }, 100);"
+        private val checkJs = "setInterval(() => { if(window.turnstile) { $jsToInject } }, 250);"
 
         @SuppressLint("SetJavaScriptEnabled")
         fun solve(): String {
             var webView: WebView? = null
 
-            val userAgent = request.header("User-Agent")
-                ?: preferences.getPrefCustomUA()?.takeIf { it.isNotBlank() }
-                ?: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+            val userAgent = client.newCall(GET(baseUrl, headers)).execute().request.header("User-Agent")!!
 
             handler.post {
                 val wv = WebView(Injekt.get<Application>())
@@ -269,17 +260,18 @@ class Koharu(
                         view.evaluateJavascript(checkJs, null)
                     }
                 }
-                wv.loadUrl(request.url.toString())
+                // Load a page that is guaranteed to have the Turnstile widget
+                wv.loadUrl("$authUrl/login")
             }
 
-            latch.await(45, TimeUnit.SECONDS)
+            latch.await(60, TimeUnit.SECONDS)
 
             handler.post {
                 webView?.stopLoading()
                 webView?.destroy()
             }
 
-            return turnstileToken ?: throw IOException("Could not solve Turnstile challenge.")
+            return turnstileToken ?: throw IOException("Could not solve Turnstile challenge (timed out).")
         }
 
         inner class JsCallback {
