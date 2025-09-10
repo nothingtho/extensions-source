@@ -143,7 +143,7 @@ class Koharu(
         }
 
         val token = try {
-            getOrFetchToken()
+            getOrFetchToken(originalRequest.header("User-Agent")!!)
         } catch (e: Exception) {
             handler.post { Toast.makeText(Injekt.get<Application>(), "Clearance Error: ${e.message}", Toast.LENGTH_LONG).show() }
             throw e
@@ -160,7 +160,7 @@ class Koharu(
             clearanceTokenRef.set(null)
 
             val newToken = try {
-                getOrFetchToken()
+                getOrFetchToken(originalRequest.header("User-Agent")!!)
             } catch (e: IOException) {
                 throw e
             }
@@ -176,7 +176,7 @@ class Koharu(
     }
 
     @Throws(IOException::class)
-    private fun getOrFetchToken(): String {
+    private fun getOrFetchToken(userAgent: String): String {
         clearanceTokenRef.get()?.let { return it }
 
         synchronized(tokenLock) {
@@ -184,7 +184,7 @@ class Koharu(
 
             toast("Schale requires clearance. Solving challenge...")
             try {
-                val turnstileToken = ClearanceWebView().solve()
+                val turnstileToken = ClearanceWebView(userAgent).solve()
                 val clearanceRequest = POST(
                     "$authUrl/clearance",
                     headers,
@@ -193,7 +193,6 @@ class Koharu(
                     .header("Authorization", "Bearer $turnstileToken")
                     .build()
 
-                // Use the main client, which has the cf_clearance cookie
                 val clearanceResponse = client.newCall(clearanceRequest).execute()
                 if (!clearanceResponse.isSuccessful) {
                     val errorBody = clearanceResponse.body.string().orEmpty()
@@ -207,6 +206,7 @@ class Koharu(
                 toast("Clearance obtained!")
                 return schaleToken
             } catch (e: Exception) {
+                clearanceTokenRef.set(null)
                 throw IOException("Failed to solve clearance challenge: ${e.message}", e)
             }
         }
@@ -218,7 +218,7 @@ class Koharu(
         }
     }
 
-    private inner class ClearanceWebView {
+    private inner class ClearanceWebView(private val userAgent: String) {
         private val latch = CountDownLatch(1)
         private var turnstileToken: String? = null
 
@@ -243,7 +243,6 @@ class Koharu(
         @SuppressLint("SetJavaScriptEnabled")
         fun solve(): String {
             var webView: WebView? = null
-            val userAgent = client.newCall(GET(baseUrl, headers)).execute().request.header("User-Agent")!!
 
             handler.post {
                 val wv = WebView(Injekt.get<Application>())
@@ -507,6 +506,7 @@ class Koharu(
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
 
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
+        // Use the pageClient for requests that require the 'crt' token.
         return pageClient.newCall(pageListRequest(chapter))
             .asObservableSuccess()
             .map(::pageListParse)
