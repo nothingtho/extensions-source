@@ -1,14 +1,7 @@
 package eu.kanade.tachiyomi.extension.all.koharu
 
-import android.annotation.SuppressLint
-import android.app.Application
 import android.content.SharedPreferences
-import android.os.Handler
-import android.os.Looper
-import android.webkit.JavascriptInterface
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import android.widget.Toast
+import android.util.Log
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -29,7 +22,6 @@ import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
 import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
 import eu.kanade.tachiyomi.lib.randomua.setRandomUserAgent
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -43,27 +35,79 @@ import keiyoushi.utils.getPreferencesLazy
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import rx.Observable
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.io.IOException
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
+
+// This is a temporary helper object for debugging Cloudflare clearance.
+// Its only purpose is to verify if the cf_clearance cookie is being
+// correctly saved to the client's cookie jar after the user solves
+// the challenge in WebView.
+object CloudflareHelper {
+    private const val TAG = "KOHARU_CF_DEBUG"
+
+    // A flag to prevent this check from running on every single request.
+    private var isClearanceChecked = false
+
+    fun checkAndLogClearance(source: HttpSource) {
+        if (isClearanceChecked) return
+
+        Log.d(TAG, "======================================================================")
+        Log.d(TAG, "  STARTING CLOUDFLARE SESSION CHECK")
+        Log.d(TAG, "======================================================================")
+
+        val client = source.client
+        val headers = source.headersBuilder().build()
+
+        try {
+            Log.d(TAG, "Attempting to connect to baseUrl to check for Cloudflare block...")
+            val response = client.newCall(GET(source.baseUrl, headers)).execute()
+
+            if (response.isSuccessful) {
+                Log.d(TAG, "Request was successful (HTTP ${response.code}). We are NOT blocked by Cloudflare.")
+                Log.d(TAG, "Now, let's inspect the cookies...")
+
+                val cookies = client.cookieJar.loadForRequest(source.baseUrl.toHttpUrl())
+                if (cookies.isEmpty()) {
+                    Log.w(TAG, "!!! WARNING: Request was successful, but NO cookies were found in the jar for this domain.")
+                } else {
+                    Log.d(TAG, "Cookies found in jar for ${source.baseUrl.toHttpUrl().host}:")
+                    var foundClearance = false
+                    cookies.forEach { cookie ->
+                        Log.d(TAG, "  - ${cookie.name} = ${cookie.value}")
+                        if (cookie.name == "cf_clearance") {
+                            Log.d(TAG, "  >>>>>>>>>> SUCCESS! cf_clearance FOUND: ${cookie.value} <<<<<<<<<<")
+                            foundClearance = true
+                        }
+                    }
+                    if (!foundClearance) {
+                        Log.e(TAG, "  !!!!!!!!!! FAILURE: Request was successful, but cf_clearance cookie was NOT FOUND. !!!!!!!!!!!")
+                    } else {
+                        isClearanceChecked = true // Mark as checked only on full success
+                    }
+                }
+            } else {
+                Log.e(TAG, "Request FAILED with HTTP ${response.code}. This means Cloudflare is likely blocking us.")
+                Log.e(TAG, "Please solve the challenge in the WebView. This error is expected.")
+                throw IOException("Cloudflare challenge required.")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "An exception occurred during the check. This is expected if Cloudflare is active.", e)
+            throw e // Re-throw to trigger Tachiyomi's WebView prompt
+        } finally {
+            Log.d(TAG, "======================================================================")
+            Log.d(TAG, "  CLOUDFLARE SESSION CHECK FINISHED")
+            Log.d(TAG, "======================================================================")
+        }
+    }
+}
 
 class Koharu(
     override val lang: String = "all",
@@ -80,7 +124,6 @@ class Koharu(
 
     private val json: Json by injectLazy()
     private val preferences: SharedPreferences by getPreferencesLazy()
-    private val handler by lazy { Handler(Looper.getMainLooper()) }
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
@@ -123,214 +166,28 @@ class Koharu(
             .build()
     }
 
+    // This is a placeholder for the future client that will handle authenticated requests.
+    // For now, it's the same as the main client.
     private val pageClient: OkHttpClient by lazy {
         client.newBuilder()
-            .addInterceptor(::schaleTokenInterceptor)
+            // .addInterceptor(::schaleTokenInterceptor) // The real interceptor will be added back later
             .build()
-    }
-
-    private val clearanceTokenRef = AtomicReference<String?>(null)
-    private val tokenLock = Any()
-
-    @Serializable private data class SchaleToken(val token: String)
-    @Serializable private data class SchaleError(val error: String)
-
-    private fun schaleTokenInterceptor(chain: Interceptor.Chain): Response {
-        val originalRequest = chain.request()
-
-        if (originalRequest.url.queryParameter("crt") != null) {
-            return chain.proceed(originalRequest)
-        }
-
-        val token = try {
-            getOrFetchToken(originalRequest.header("User-Agent")!!)
-        } catch (e: Exception) {
-            handler.post { Toast.makeText(Injekt.get<Application>(), "Clearance Error: ${e.message}", Toast.LENGTH_LONG).show() }
-            throw e
-        }
-
-        val requestWithCrt = originalRequest.newBuilder()
-            .url(originalRequest.url.newBuilder().addQueryParameter("crt", token).build())
-            .build()
-
-        var response = chain.proceed(requestWithCrt)
-
-        if (response.code in listOf(401, 403)) {
-            response.close()
-            clearanceTokenRef.set(null)
-
-            val newToken = try {
-                getOrFetchToken(originalRequest.header("User-Agent")!!)
-            } catch (e: IOException) {
-                throw e
-            }
-
-            val retryRequest = originalRequest.newBuilder()
-                .url(originalRequest.url.newBuilder().addQueryParameter("crt", newToken).build())
-                .build()
-
-            response = chain.proceed(retryRequest)
-        }
-
-        return response
-    }
-
-    @Throws(IOException::class)
-    private fun getOrFetchToken(userAgent: String): String {
-        clearanceTokenRef.get()?.let { return it }
-
-        synchronized(tokenLock) {
-            clearanceTokenRef.get()?.let { return it }
-
-            toast("Schale requires clearance. Solving challenge...")
-            try {
-                val turnstileToken = ClearanceWebView(userAgent).solve()
-                val clearanceRequest = POST(
-                    "$authUrl/clearance",
-                    headers,
-                    body = "".toRequestBody(null),
-                ).newBuilder()
-                    .header("Authorization", "Bearer $turnstileToken")
-                    .build()
-
-                val clearanceResponse = client.newCall(clearanceRequest).execute()
-                if (!clearanceResponse.isSuccessful) {
-                    val errorBody = clearanceResponse.body.string().orEmpty()
-                    val errorMsg = try { json.decodeFromString<SchaleError>(errorBody).error } catch (_: Exception) { errorBody }
-                    throw IOException("Failed to exchange Turnstile token. Server said: $errorMsg (HTTP ${clearanceResponse.code})")
-                }
-
-                val body = clearanceResponse.body.string()
-                val schaleToken = json.decodeFromString<SchaleToken>(body).token
-                clearanceTokenRef.set(schaleToken)
-                toast("Clearance obtained!")
-                return schaleToken
-            } catch (e: Exception) {
-                clearanceTokenRef.set(null)
-                throw IOException("Failed to solve clearance challenge: ${e.message}", e)
-            }
-        }
-    }
-
-    private fun toast(message: String) {
-        handler.post {
-            Toast.makeText(Injekt.get<Application>(), message, Toast.LENGTH_LONG).show()
-        }
-    }
-
-    private inner class ClearanceWebView(private val userAgent: String) {
-        private val latch = CountDownLatch(1)
-        private var turnstileToken: String? = null
-
-        private val jsToInject = """
-            (function() {
-                if (window.turnstileCallbackInjected) return;
-                window.turnstileCallbackInjected = true;
-                const originalRender = window.turnstile.render;
-                window.turnstile.render = function(container, params) {
-                    const originalCallback = params.callback;
-                    params.callback = function(token) {
-                        JSInterface.receiveToken(token);
-                        if (originalCallback) originalCallback(token);
-                    };
-                    return originalRender(container, params);
-                };
-            })();
-        """.trimIndent()
-
-        private val checkJs = "setInterval(() => { if(window.turnstile) { $jsToInject } }, 250);"
-
-        @SuppressLint("SetJavaScriptEnabled")
-        fun solve(): String {
-            var webView: WebView? = null
-
-            handler.post {
-                val wv = WebView(Injekt.get<Application>())
-                webView = wv
-                wv.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    userAgentString = userAgent
-                    loadWithOverviewMode = true
-                    useWideViewPort = true
-                }
-                wv.addJavascriptInterface(JsCallback(), "JSInterface")
-                wv.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView, url: String) {
-                        view.evaluateJavascript(checkJs, null)
-                    }
-                }
-                wv.loadUrl("$authUrl/login")
-            }
-
-            latch.await(60, TimeUnit.SECONDS)
-
-            handler.post {
-                webView?.stopLoading()
-                webView?.destroy()
-            }
-
-            return turnstileToken ?: throw IOException("Could not solve Turnstile challenge (timed out).")
-        }
-
-        inner class JsCallback {
-            @JavascriptInterface
-            fun receiveToken(token: String) {
-                if (turnstileToken == null) {
-                    turnstileToken = token
-                    latch.countDown()
-                }
-            }
-        }
     }
 
     private fun getManga(book: Entry) = SManga.create().apply {
         setUrlWithoutDomain("${book.id}/${book.key}")
-        title = if (remadd()) {
-            book.title.shortenTitle()
-        } else {
-            book.title
-        }
+        title = if (remadd()) book.title.shortenTitle() else book.title
         thumbnail_url = book.thumbnail.path
     }
 
-    private fun getImagesByMangaData(entry: MangaData, entryId: String, entryKey: String): Pair<ImagesInfo, String> {
-        val data = entry.data
-        fun getIPK(
-            ori: DataKey?,
-            alt1: DataKey?,
-            alt2: DataKey?,
-            alt3: DataKey?,
-            alt4: DataKey?,
-        ): Pair<Int?, String?> {
-            return Pair(
-                ori?.id ?: alt1?.id ?: alt2?.id ?: alt3?.id ?: alt4?.id,
-                ori?.key ?: alt1?.key ?: alt2?.key ?: alt3?.key ?: alt4?.key,
-            )
-        }
-        val (id, public_key) = when (quality()) {
-            "1600" -> getIPK(data.`1600`, data.`1280`, data.`0`, data.`980`, data.`780`)
-            "1280" -> getIPK(data.`1280`, data.`1600`, data.`0`, data.`980`, data.`780`)
-            "980" -> getIPK(data.`980`, data.`1280`, data.`0`, data.`1600`, data.`780`)
-            "780" -> getIPK(data.`780`, data.`980`, data.`0`, data.`1280`, data.`1600`)
-            else -> getIPK(data.`0`, data.`1600`, data.`1280`, data.`980`, data.`780`)
-        }
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> {
+        CloudflareHelper.checkAndLogClearance(this)
+        return super.fetchPopularManga(page)
+    }
 
-        if (id == null || public_key == null) {
-            throw Exception("No Images Found")
-        }
-
-        val realQuality = when (id) {
-            data.`1600`?.id -> "1600"
-            data.`1280`?.id -> "1280"
-            data.`980`?.id -> "980"
-            data.`780`?.id -> "780"
-            else -> "0"
-        }
-
-        val imagesResponse = pageClient.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", headers)).execute()
-        return imagesResponse.parseAs<ImagesInfo>() to realQuality
+    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> {
+        CloudflareHelper.checkAndLogClearance(this)
+        return super.fetchLatestUpdates(page)
     }
 
     override fun latestUpdatesRequest(page: Int) = GET(
@@ -505,28 +362,13 @@ class Koharu(
 
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
 
+    // For now, this is a placeholder. Page loading will fail until we implement the 'crt' token logic.
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        // Use the pageClient for requests that require the 'crt' token.
-        return pageClient.newCall(pageListRequest(chapter))
-            .asObservableSuccess()
-            .map(::pageListParse)
+        return Observable.error(UnsupportedOperationException("Page loading requires solving the 'crt' token challenge, which is the next step."))
     }
 
-    override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", headers)
-
-    override fun pageListParse(response: Response): List<Page> {
-        val mangaData = response.parseAs<MangaData>()
-        val urlString = response.request.url.toString()
-        val matches = Regex("""/detail/(\d+)/([a-z\d]+)""").find(urlString)
-            ?: throw IOException("Failed to parse URL: $urlString")
-        val (entryId, entryKey) = matches.destructured
-        val imagesInfo = getImagesByMangaData(mangaData, entryId, entryKey)
-
-        return imagesInfo.first.entries.mapIndexed { index, image ->
-            Page(index, imageUrl = "${imagesInfo.first.base}/${image.path}?w=${imagesInfo.second}")
-        }
-    }
-
+    override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException()
+    override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException()
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
