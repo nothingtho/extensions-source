@@ -51,6 +51,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import rx.Observable
@@ -192,7 +193,7 @@ class Koharu(
                     .header("Authorization", "Bearer $turnstileToken")
                     .build()
 
-                // Use the main client, which has the cf_clearance cookie from manual solving
+                // Use the main client, which has the cf_clearance cookie
                 val clearanceResponse = client.newCall(clearanceRequest).execute()
                 if (!clearanceResponse.isSuccessful) {
                     val errorBody = clearanceResponse.body.string().orEmpty()
