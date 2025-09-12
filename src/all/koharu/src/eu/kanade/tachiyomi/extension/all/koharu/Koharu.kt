@@ -96,7 +96,6 @@ class Koharu(
             @JavascriptInterface
             fun onToken(token: String?) {
                 if (token != null) {
-                    // Make sure token is not empty or "null" string
                     if (token.isNotEmpty() && token != "null") {
                         preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
                         latch.countDown()
@@ -110,14 +109,13 @@ class Koharu(
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 databaseEnabled = true
-                // **FIXED:** Use the static User-Agent string provided by the user
+                // **FIXED:** Use the static User-Agent string to avoid the crash
                 userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
             }
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, url: String) {
                     super.onPageFinished(view, url)
                     if (url == "$baseUrl/") {
-                        // Continuously check for the token in localStorage
                         view.evaluateJavascript(
                             """
                             (function() {
@@ -541,6 +539,8 @@ class WebViewCookieJar : okhttp3.CookieJar {
         cookies.forEach { cookie ->
             cookieManager.setCookie(urlString, cookie.toString())
         }
+        // **FIXED:** Force the cookie manager to persist cookies immediately.
+        cookieManager.flush()
     }
 
     override fun loadForRequest(url: okhttp3.HttpUrl): List<Cookie> {
