@@ -91,47 +91,32 @@ class Koharu(
     private val webViewCookieJar = WebViewCookieJar()
 
     private val webView by lazy {
-        @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
-        class JsObject(private val latch: CountDownLatch) {
-            @JavascriptInterface
-            fun onToken(token: String?) {
-                if (token != null) {
-                    if (token.isNotEmpty() && token != "null") {
-                        preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
-                        latch.countDown()
-                    }
-                }
-            }
-        }
-
         WebView(application).apply {
+            @SuppressLint("SetJavaScriptEnabled")
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 databaseEnabled = true
-                // **FIXED:** Use the static User-Agent string to avoid the crash
                 userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
             }
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, url: String) {
                     super.onPageFinished(view, url)
-                    if (url == "$baseUrl/") {
-                        view.evaluateJavascript(
-                            """
-                            (function() {
-                                const checkToken = () => {
-                                    const token = localStorage.getItem('clearance');
-                                    if (token) {
-                                        Android.onToken(token);
-                                    } else {
-                                        setTimeout(checkToken, 500);
-                                    }
-                                };
-                                checkToken();
-                            })();
-                            """.trimIndent(),
-                        ) { /* Do nothing with result */ }
-                    }
+                    // **FIXED:** Inject a script that hooks localStorage.setItem instead of polling.
+                    // This is stealthier and less likely to be detected as bot activity.
+                    view.evaluateJavascript(
+                        """
+                        (function() {
+                            const originalSetItem = localStorage.setItem;
+                            localStorage.setItem = function(key, value) {
+                                if (key === 'clearance' && window.Android && typeof window.Android.onToken === 'function') {
+                                    window.Android.onToken(value);
+                                }
+                                originalSetItem.apply(this, arguments);
+                            };
+                        })();
+                        """.trimIndent(),
+                    ) { /* Do nothing with result */ }
                 }
             }
         }
@@ -151,13 +136,11 @@ class Koharu(
     private inner class CrtInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val originalRequest = chain.request()
-
             if (!originalRequest.url.toString().startsWith(apiUrl)) {
                 return chain.proceed(originalRequest)
             }
 
             val crt = preferences.getString(PREF_CRT_TOKEN, null)
-
             if (crt == null) {
                 return handleCrtRequest(originalRequest, chain)
             }
@@ -165,11 +148,7 @@ class Koharu(
             val newUrl = originalRequest.url.newBuilder()
                 .addQueryParameter("crt", crt)
                 .build()
-
-            val newRequest = originalRequest.newBuilder()
-                .url(newUrl)
-                .build()
-
+            val newRequest = originalRequest.newBuilder().url(newUrl).build()
             val response = chain.proceed(newRequest)
 
             if (response.code in listOf(401, 403)) {
@@ -177,7 +156,6 @@ class Koharu(
                 preferences.edit().remove(PREF_CRT_TOKEN).apply()
                 return handleCrtRequest(originalRequest, chain)
             }
-
             return response
         }
 
@@ -189,14 +167,12 @@ class Koharu(
                 val newUrl = request.url.newBuilder()
                     .addQueryParameter("crt", currentToken)
                     .build()
-                val newRequest = request.newBuilder().url(newUrl).build()
-                return chain.proceed(newRequest)
+                return chain.proceed(request.newBuilder().url(newUrl).build())
             }
 
             crtTokenLatch = CountDownLatch(1)
             val handler = Handler(Looper.getMainLooper())
 
-            @SuppressLint("AddJavascriptInterface")
             class JsObject(private val latch: CountDownLatch) {
                 @JavascriptInterface
                 fun onToken(token: String?) {
@@ -222,10 +198,7 @@ class Koharu(
             val newUrl = request.url.newBuilder()
                 .addQueryParameter("crt", newCrt)
                 .build()
-
-            val newRequest = request.newBuilder().url(newUrl).build()
-
-            return chain.proceed(newRequest)
+            return chain.proceed(request.newBuilder().url(newUrl).build())
         }
     }
 
@@ -233,12 +206,10 @@ class Koharu(
         override fun intercept(chain: Interceptor.Chain): Response {
             val request = chain.request()
             val response = chain.proceed(request)
-
             if (response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true) {
                 response.close()
                 throw IOException("Cloudflare challenge required. Please open in WebView, solve the puzzle, and then retry.")
             }
-
             return response
         }
     }
@@ -539,7 +510,6 @@ class WebViewCookieJar : okhttp3.CookieJar {
         cookies.forEach { cookie ->
             cookieManager.setCookie(urlString, cookie.toString())
         }
-        // **FIXED:** Force the cookie manager to persist cookies immediately.
         cookieManager.flush()
     }
 
