@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.extension.all.koharu
 
 import android.annotation.SuppressLint
 import android.app.Application
+import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
 import android.webkit.CookieManager
@@ -35,7 +36,6 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
-import keiyoushi.utils.getPreferencesLazy
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -57,6 +57,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.reflect.KProperty
 
 class Koharu(
     override val lang: String = "all",
@@ -67,12 +68,11 @@ class Koharu(
     override val baseUrl = "https://niyaniya.moe"
     override val id = if (lang == "en") 1484902275639232927 else super.id
     private val apiUrl = "https://api.schale.network"
-    private val authUrl = "https://auth.schale.network"
     private val apiBooksUrl = "$apiUrl/books"
     override val supportsLatest = true
 
     private val json: Json by injectLazy()
-    private val preferences: SharedPreferences by getPreferencesLazy()
+    private val preferences: SharedPreferences by lazy { Injekt.get<Application>().getSharedPreferences("source_$id", 0) }
     private val application: Application by injectLazy()
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
@@ -90,46 +90,48 @@ class Koharu(
 
     private val webViewCookieJar = WebViewCookieJar()
 
-    @SuppressLint("SetJavaScriptEnabled")
     private val webView by lazy {
-        Handler(Looper.getMainLooper()).let {
-            it.post {
-                val webview = WebView(application)
-                webview.settings.javaScriptEnabled = true
-                webview.settings.domStorageEnabled = true
-                webview.settings.databaseEnabled = true
-                webview.settings.userAgentString = network.client.newCall(GET(baseUrl)).execute().request.header("User-Agent")
-                webview.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView, url: String) {
-                        super.onPageFinished(view, url)
-                        if (url == "$baseUrl/") {
-                             // This is the check for the CRT token after the page has loaded
-                             view.evaluateJavascript("localStorage.getItem('clearance')") { result ->
-                                 val token = json.decodeFromString<String?>(result)
-                                 if (token != null) {
-                                     preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
-                                     crtTokenLatch.countDown()
-                                 }
-                             }
-                        }
-                    }
+        @SuppressLint("SetJavaScriptEnabled")
+        class JsObject(private val latch: CountDownLatch) {
+            @JavascriptInterface
+            fun onToken(token: String?) {
+                if (token != null) {
+                    preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
+                    latch.countDown()
                 }
-                // Add an interface for communication
-                webview.addJavascriptInterface(
-                    object {
-                        @JavascriptInterface
-                        fun onToken(token: String?) {
-                            if (token != null) {
-                                preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
-                                crtTokenLatch.countDown()
-                            }
-                        }
-                    },
-                    "Android",
-                )
             }
         }
-        WebView(application) // Return a WebView instance
+
+        val webview = WebView(application)
+        webview.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            userAgentString = network.client.newCall(GET(baseUrl)).execute().request.header("User-Agent")
+        }
+        webview.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String) {
+                super.onPageFinished(view, url)
+                if (url == "$baseUrl/") {
+                    view.evaluateJavascript(
+                        """
+                        (function() {
+                            const checkToken = () => {
+                                const token = localStorage.getItem('clearance');
+                                if (token) {
+                                    Android.onToken(token);
+                                } else {
+                                    setTimeout(checkToken, 500);
+                                }
+                            };
+                            checkToken();
+                        })();
+                        """.trimIndent(),
+                    ) { /* Do nothing with result */ }
+                }
+            }
+        }
+        webview
     }
 
     private var crtTokenLatch = CountDownLatch(0)
@@ -150,13 +152,11 @@ class Koharu(
             if (!originalRequest.url.toString().startsWith(apiUrl)) {
                 return chain.proceed(originalRequest)
             }
-            
+
             val crt = preferences.getString(PREF_CRT_TOKEN, null)
 
             if (crt == null) {
-                // Token is missing, we need to fetch it
-                val newRequest = chain.request().newBuilder().build()
-                return handleCrtRequest(newRequest, chain)
+                return handleCrtRequest(originalRequest, chain)
             }
 
             val newUrl = originalRequest.url.newBuilder()
@@ -169,22 +169,21 @@ class Koharu(
 
             val response = chain.proceed(newRequest)
 
-            // If token is expired or invalid, server will respond with 401/403
             if (response.code in listOf(401, 403)) {
                 response.close()
-                preferences.edit().remove(PREF_CRT_TOKEN).apply() // Invalidate the old token
+                preferences.edit().remove(PREF_CRT_TOKEN).apply()
                 return handleCrtRequest(originalRequest, chain)
             }
-            
+
             return response
         }
-        
+
+        @SuppressLint("AddJavascriptInterface")
         @Synchronized
         private fun handleCrtRequest(request: Request, chain: Interceptor.Chain): Response {
-            // Check again inside synchronized block
             val currentToken = preferences.getString(PREF_CRT_TOKEN, null)
             if (currentToken != null) {
-                 val newUrl = request.url.newBuilder()
+                val newUrl = request.url.newBuilder()
                     .addQueryParameter("crt", currentToken)
                     .build()
                 val newRequest = request.newBuilder().url(newUrl).build()
@@ -192,18 +191,29 @@ class Koharu(
             }
 
             crtTokenLatch = CountDownLatch(1)
-            
             val handler = Handler(Looper.getMainLooper())
+
             handler.post {
                 Toast.makeText(application, "Attempting to get clearance token...", Toast.LENGTH_SHORT).show()
+                @SuppressLint("AddJavascriptInterface")
+                class JsObject(private val latch: CountDownLatch) {
+                    @JavascriptInterface
+                    fun onToken(token: String?) {
+                        if (token != null) {
+                            preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
+                            latch.countDown()
+                        }
+                    }
+                }
+                webView.addJavascriptInterface(JsObject(crtTokenLatch), "Android")
                 webView.loadUrl(baseUrl)
             }
-            
-            // Wait for the WebView to get the token, with a timeout
+
             crtTokenLatch.await(45, TimeUnit.SECONDS)
-            
+            handler.post { webView.removeJavascriptInterface("Android") }
+
             val newCrt = preferences.getString(PREF_CRT_TOKEN, null)
-                ?: throw IOException("Failed to get clearance token. Open in WebView and solve challenge.")
+                ?: throw IOException("Failed to get clearance token. Open in WebView, solve challenge, and retry.")
 
             val newUrl = request.url.newBuilder()
                 .addQueryParameter("crt", newCrt)
@@ -222,7 +232,6 @@ class Koharu(
 
             if (response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true) {
                 response.close()
-                // This is the trigger for the user to solve the initial CF challenge
                 throw IOException("Cloudflare challenge required. Please open in WebView, solve the puzzle, and then retry.")
             }
 
@@ -271,8 +280,7 @@ class Koharu(
         }
 
         val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", apiHeaders())).execute()
-        val images = imagesResponse.parseAs<ImagesInfo>() to realQuality
-        return images
+        return imagesResponse.parseAs<ImagesInfo>() to realQuality
     }
 
     override fun latestUpdatesRequest(page: Int) = GET(
@@ -405,23 +413,23 @@ class Koharu(
     private fun fetchTags() {
         if (tagsFetchAttempts < 3 && !tagsFetched) {
             try {
-                client.newCall(
-                    GET("$apiBooksUrl/tags/filters", apiHeaders()),
-                ).execute()
-                    .use { it.parseAs<List<Filter>>() }
-                    .also { tagsFetched = true }
-                    .takeIf { it.isNotEmpty() }
-                    ?.map { it.toTag() }
-                    ?.also { tags ->
-                        genreList = tags.filterIsInstance<KoharuFilters.Genre>()
-                        femaleList = tags.filterIsInstance<KoharuFilters.Female>()
-                        maleList = tags.filterIsInstance<KoharuFilters.Male>()
-                        artistList = tags.filterIsInstance<KoharuFilters.Artist>()
-                        circleList = tags.filterIsInstance<KoharuFilters.Circle>()
-                        parodyList = tags.filterIsInstance<KoharuFilters.Parody>()
-                        mixedList = tags.filterIsInstance<KoharuFilters.Mixed>()
-                        otherList = tags.filterIsInstance<KoharuFilters.Other>()
-                    }
+                client.newCall(GET("$apiBooksUrl/tags/filters", apiHeaders())).execute().use { response ->
+                    if (!response.isSuccessful) return
+                    response.parseAs<List<Filter>>()
+                        .also { tagsFetched = true }
+                        .takeIf { it.isNotEmpty() }
+                        ?.map { it.toTag() }
+                        ?.also { tags ->
+                            genreList = tags.filterIsInstance<KoharuFilters.Genre>()
+                            femaleList = tags.filterIsInstance<KoharuFilters.Female>()
+                            maleList = tags.filterIsInstance<KoharuFilters.Male>()
+                            artistList = tags.filterIsInstance<KoharuFilters.Artist>()
+                            circleList = tags.filterIsInstance<KoharuFilters.Circle>()
+                            parodyList = tags.filterIsInstance<KoharuFilters.Parody>()
+                            mixedList = tags.filterIsInstance<KoharuFilters.Mixed>()
+                            otherList = tags.filterIsInstance<KoharuFilters.Other>()
+                        }
+                }
             } catch (_: Exception) {
             } finally {
                 tagsFetchAttempts++
