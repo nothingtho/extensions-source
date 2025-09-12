@@ -1,28 +1,25 @@
 package eu.kanade.tachiyomi.extension.all.koharu
 
+import android.annotation.SuppressLint
+import android.app.Application
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.webkit.CookieManager
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.artistList
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.circleList
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.femaleList
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.genreList
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.getFilters
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.maleList
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.mixedList
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.otherList
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.parodyList
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetchAttempts
-import eu.kanade.tachiyomi.extension.all.koharu.KoharuFilters.tagsFetched
 import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
 import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
 import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
 import eu.kanade.tachiyomi.lib.randomua.setRandomUserAgent
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -32,9 +29,6 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.utils.getPreferencesLazy
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -43,71 +37,76 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
 
-// This is a temporary helper object for debugging Cloudflare clearance.
-// Its only purpose is to verify if the cf_clearance cookie is being
-// correctly saved to the client's cookie jar after the user solves
-// the challenge in WebView.
-object CloudflareHelper {
-    private const val TAG = "KOHARU_CF_DEBUG"
+// This object is a diagnostic tool to test Cloudflare session stability.
+// It creates a WebView with settings designed to mimic a real browser as closely as possible.
+object DebugWebView {
+    private const val TAG = "KOHARU_DEBUG_WEBVIEW"
+    private val handler = Handler(Looper.getMainLooper())
 
-    // A flag to prevent this check from running on every single request.
-    private var isClearanceChecked = false
+    @SuppressLint("SetJavaScriptEnabled")
+    fun openInDebugWebView(source: HttpSource, url: String) {
+        handler.post {
+            try {
+                val context = Injekt.get<Application>()
+                val webView = WebView(context)
+                val cookieManager = CookieManager.getInstance()
 
-    fun checkAndLogClearance(source: HttpSource) {
-        if (isClearanceChecked) return
+                // Pillar 1: Persistent, Enabled Storage
+                cookieManager.setAcceptCookie(true)
+                cookieManager.setAcceptThirdPartyCookies(webView, true)
 
-        Log.d(TAG, "======================================================================")
-        Log.d(TAG, "  STARTING CLOUDFLARE SESSION CHECK")
-        Log.d(TAG, "======================================================================")
+                webView.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    cacheMode = WebSettings.LOAD_DEFAULT
 
-        val client = source.client
-        // Correctly access public headers property, not the protected builder method
-        val headers = source.headers
+                    // Pillar 2: Consistent and Believable Identity
+                    // We get the User-Agent directly from the client that Tachiyomi will use.
+                    val userAgent = source.client.newCall(GET(source.baseUrl, source.headers)).execute().request.header("User-Agent")!!
+                    userAgentString = userAgent
+                    Log.d(TAG, "WebView User-Agent set to: $userAgent")
 
-        try {
-            Log.d(TAG, "Attempting to connect to baseUrl to check for Cloudflare block...")
-            val response = client.newCall(GET(source.baseUrl, headers)).execute()
+                    // Pillar 3: Full Web Functionality
+                    javaScriptCanOpenWindowsAutomatically = true
+                    loadWithOverviewMode = true
+                    useWideViewPort = true
+                    setSupportZoom(true)
+                    builtInZoomControls = true
+                    displayZoomControls = false
+                }
 
-            if (response.isSuccessful) {
-                Log.d(TAG, "Request was successful (HTTP ${response.code}). We are NOT blocked by Cloudflare.")
-                Log.d(TAG, "Now, let's inspect the cookies...")
+                // Sync cookies from the app's client to the WebView
+                source.client.cookieJar.loadForRequest(url.toHttpUrl()).forEach {
+                    cookieManager.setCookie(url, it.toString())
+                }
 
-                val cookies = client.cookieJar.loadForRequest(source.baseUrl.toHttpUrl())
-                if (cookies.isEmpty()) {
-                    Log.w(TAG, "!!! WARNING: Request was successful, but NO cookies were found in the jar for this domain.")
-                } else {
-                    Log.d(TAG, "Cookies found in jar for ${source.baseUrl.toHttpUrl().host}:")
-                    var foundClearance = false
-                    cookies.forEach { cookie ->
-                        Log.d(TAG, "  - ${cookie.name} = ${cookie.value}")
-                        if (cookie.name == "cf_clearance") {
-                            Log.d(TAG, "  >>>>>>>>>> SUCCESS! cf_clearance FOUND: ${cookie.value} <<<<<<<<<<")
-                            foundClearance = true
-                        }
-                    }
-                    if (!foundClearance) {
-                        Log.e(TAG, "  !!!!!!!!!! FAILURE: Request was successful, but cf_clearance cookie was NOT FOUND. !!!!!!!!!!!")
-                    } else {
-                        isClearanceChecked = true // Mark as checked only on full success
+                webView.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        Log.d(TAG, "WebView finished loading: $url")
+                        Toast.makeText(context, "Debug WebView loaded. Test browsing now.", Toast.LENGTH_LONG).show()
                     }
                 }
-            } else {
-                Log.e(TAG, "Request FAILED with HTTP ${response.code}. This means Cloudflare is likely blocking us.")
-                Log.e(TAG, "Please solve the challenge in the WebView. This error is expected.")
-                throw IOException("Cloudflare challenge required.")
+
+                val dialog = android.app.AlertDialog.Builder(context)
+                    .setView(webView)
+                    .setNegativeButton("Close") { dialog, _ -> dialog.dismiss() }
+                    .create()
+
+                dialog.show()
+                webView.loadUrl(url)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to create debug WebView", e)
+                Toast.makeText(Injekt.get<Application>(), "Error creating WebView: ${e.message}", Toast.LENGTH_LONG).show()
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "An exception occurred during the check. This is expected if Cloudflare is active.", e)
-            throw e // Re-throw to trigger Tachiyomi's WebView prompt
-        } finally {
-            Log.d(TAG, "======================================================================")
-            Log.d(TAG, "  CLOUDFLARE SESSION CHECK FINISHED")
-            Log.d(TAG, "======================================================================")
         }
     }
 }
@@ -121,7 +120,6 @@ class Koharu(
     override val baseUrl = "https://niyaniya.moe"
     override val id = if (lang == "en") 1484902275639232927 else super.id
     private val apiUrl = "https://api.schale.network"
-    private val authUrl = "https://auth.schale.network"
     private val apiBooksUrl = "$apiUrl/books"
     override val supportsLatest = true
 
@@ -169,201 +167,43 @@ class Koharu(
             .build()
     }
 
-    private fun getManga(book: Entry) = SManga.create().apply {
-        setUrlWithoutDomain("${book.id}/${book.key}")
-        title = if (remadd()) book.title.shortenTitle() else book.title
-        thumbnail_url = book.thumbnail.path
-    }
+    // --- Start of Stripped-Down Code ---
 
-    override fun fetchPopularManga(page: Int): Observable<MangasPage> {
-        CloudflareHelper.checkAndLogClearance(this)
-        return super.fetchPopularManga(page)
-    }
-
-    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> {
-        CloudflareHelper.checkAndLogClearance(this)
-        return super.fetchLatestUpdates(page)
-    }
-
-    override fun latestUpdatesRequest(page: Int) = GET(
-        apiBooksUrl.toHttpUrl().newBuilder().apply {
-            addQueryParameter("page", page.toString())
-            val terms: MutableList<String> = mutableListOf()
-            if (lang != "all") {
-                terms += "language:\"^$searchLang$\""
-            }
-            alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
-                terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
-            }
-            if (terms.isNotEmpty()) {
-                addQueryParameter("s", terms.joinToString(" "))
-            }
-        }.build(),
-        headers,
-    )
-
-    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
-
-    override fun popularMangaRequest(page: Int) = GET(
-        apiBooksUrl.toHttpUrl().newBuilder().apply {
-            addQueryParameter("sort", "8")
-            addQueryParameter("page", page.toString())
-            val terms: MutableList<String> = mutableListOf()
-            if (lang != "all") {
-                terms += "language:\"^$searchLang$\""
-            }
-            alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
-                terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
-            }
-            if (terms.isNotEmpty()) {
-                addQueryParameter("s", terms.joinToString(" "))
-            }
-        }.build(),
-        headers,
-    )
+    // LATEST UPDATES & POPULAR: These will now serve as our trigger for the debug WebView.
+    override fun popularMangaRequest(page: Int): Request = GET(baseUrl, headers)
+    override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl, headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val data = response.parseAs<Books>()
-        return MangasPage(data.entries.map(::getManga), data.page * data.limit < data.total)
+        // We throw an exception here on purpose. This will show the "Open in WebView" button.
+        // After solving in WebView, refreshing again will trigger fetchMangaDetails.
+        throw IOException("Please solve Cloudflare in WebView first, then refresh again to open the debug WebView.")
+    }
+    override fun latestUpdatesParse(response: Response): MangasPage = popularMangaParse(response)
+
+    // DETAILS: This is now the entry point for our test.
+    override fun fetchMangaDetails(manga: SManga): Observable<SManga> {
+        // Instead of fetching details, we launch our debug WebView.
+        DebugWebView.openInDebugWebView(this, "$baseUrl${manga.url}")
+        // Return an empty observable because we are not actually fetching details.
+        return Observable.empty()
     }
 
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        return if (query.startsWith(PREFIX_ID_KEY_SEARCH)) {
-            val ipk = query.removePrefix(PREFIX_ID_KEY_SEARCH)
-            client.newCall(GET("$apiBooksUrl/detail/$ipk", headers))
-                .asObservableSuccess()
-                .map { MangasPage(listOf(mangaDetailsParse(it)), false) }
-        } else {
-            super.fetchSearchManga(page, query, filters)
-        }
-    }
+    // --- All other functions are disabled for this test ---
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = apiBooksUrl.toHttpUrl().newBuilder().apply {
-            val terms: MutableList<String> = mutableListOf()
-            val includedTags: MutableList<Int> = mutableListOf()
-            val excludedTags: MutableList<Int> = mutableListOf()
-            if (lang != "all") {
-                terms += "language:\"^$searchLang$\""
-            }
-            alwaysExcludeTags()?.takeIf { it.isNotBlank() }?.let {
-                terms += "tag:\"${it.split(",").joinToString(",") { "-${it.trim()}" }}\""
-            }
-            filters.forEach { filter ->
-                when (filter) {
-                    is KoharuFilters.SortFilter -> addQueryParameter("sort", filter.getValue())
-                    is KoharuFilters.CategoryFilter -> filter.state.filter { it.state }.let {
-                        if (it.isNotEmpty()) {
-                            addQueryParameter("cat", it.sumOf { tag -> tag.value }.toString())
-                        }
-                    }
-                    is KoharuFilters.TagFilter -> {
-                        includedTags += filter.state.filter { it.isIncluded() }.map { it.id }
-                        excludedTags += filter.state.filter { it.isExcluded() }.map { it.id }
-                    }
-                    is KoharuFilters.GenreConditionFilter -> if (filter.state > 0) {
-                        addQueryParameter(filter.param, filter.toUriPart())
-                    }
-                    is KoharuFilters.TextFilter -> filter.state.takeIf { it.isNotEmpty() }?.let {
-                        val tags = it.split(",").filter(String::isNotBlank).joinToString(",")
-                        if (tags.isNotBlank()) {
-                            terms += "${filter.type}:${if (filter.type == "pages") tags else "\"$tags\""}"
-                        }
-                    }
-                    else -> {}
-                }
-            }
-            if (includedTags.isNotEmpty()) {
-                addQueryParameter("include", includedTags.joinToString(","))
-            }
-            if (excludedTags.isNotEmpty()) {
-                addQueryParameter("exclude", excludedTags.joinToString(","))
-            }
-            if (query.isNotEmpty()) {
-                terms.add("title:\"$query\"")
-            }
-            if (terms.isNotEmpty()) {
-                addQueryParameter("s", terms.joinToString(" "))
-            }
-            addQueryParameter("page", page.toString())
-        }.build()
-        return GET(url, headers)
-    }
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = throw UnsupportedOperationException("Disabled for debug")
+    override fun searchMangaParse(response: Response): MangasPage = throw UnsupportedOperationException("Disabled for debug")
+    override fun mangaDetailsParse(response: Response): SManga = throw UnsupportedOperationException("Disabled for debug")
+    override fun chapterListParse(response: Response): List<SChapter> = throw UnsupportedOperationException("Disabled for debug")
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.error(UnsupportedOperationException("Disabled for debug"))
+    override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException("Disabled for debug")
+    override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException("Disabled for debug")
+    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException("Disabled for debug")
 
-    override fun searchMangaParse(response: Response) = popularMangaParse(response)
+    // --- Boilerplate and Settings (unchanged) ---
 
-    override fun getFilterList(): FilterList {
-        launchIO { fetchTags() }
-        return getFilters()
-    }
-
+    override fun getFilterList(): FilterList = FilterList() // Disabled for now
     private val scope = CoroutineScope(Dispatchers.IO)
     private fun launchIO(block: () -> Unit) = scope.launch { block() }
-
-    private fun fetchTags() {
-        if (tagsFetchAttempts < 3 && !tagsFetched) {
-            try {
-                client.newCall(GET("$apiBooksUrl/tags/filters", headers))
-                    .execute()
-                    .use { it.parseAs<List<Filter>>() }
-                    .also { tagsFetched = true }
-                    .takeIf { it.isNotEmpty() }
-                    ?.map(Filter::toTag)
-                    ?.also { tags ->
-                        genreList = tags.filterIsInstance<KoharuFilters.Genre>()
-                        femaleList = tags.filterIsInstance<KoharuFilters.Female>()
-                        maleList = tags.filterIsInstance<KoharuFilters.Male>()
-                        artistList = tags.filterIsInstance<KoharuFilters.Artist>()
-                        circleList = tags.filterIsInstance<KoharuFilters.Circle>()
-                        parodyList = tags.filterIsInstance<KoharuFilters.Parody>()
-                        mixedList = tags.filterIsInstance<KoharuFilters.Mixed>()
-                        otherList = tags.filterIsInstance<KoharuFilters.Other>()
-                    }
-            } catch (_: Exception) {
-            } finally {
-                tagsFetchAttempts++
-            }
-        }
-    }
-
-    override fun mangaDetailsRequest(manga: SManga) = GET("$apiBooksUrl/detail/${manga.url}", headers)
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        val mangaDetail = response.parseAs<MangaDetail>()
-        return mangaDetail.toSManga().apply {
-            setUrlWithoutDomain("${mangaDetail.id}/${mangaDetail.key}")
-            title = if (remadd()) {
-                mangaDetail.title.shortenTitle()
-            } else {
-                mangaDetail.title
-            }
-        }
-    }
-
-    override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
-
-    override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", headers)
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val manga = response.parseAs<MangaDetail>()
-        return listOf(
-            SChapter.create().apply {
-                name = "Chapter"
-                url = "${manga.id}/${manga.key}"
-                date_upload = (manga.updated_at ?: manga.created_at)
-            },
-        )
-    }
-
-    override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
-
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return Observable.error(UnsupportedOperationException("Page loading is disabled in this debug build."))
-    }
-
-    override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException()
-    override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException()
-    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
@@ -378,22 +218,19 @@ class Koharu(
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_REM_ADD
             title = "Remove additional information in title"
-            summary = "Remove anything in brackets from manga titles.\n" +
-                "Reload manga to apply changes to loaded manga."
+            summary = "Remove anything in brackets from manga titles."
             setDefaultValue(false)
         }.also(screen::addPreference)
 
         EditTextPreference(screen.context).apply {
             key = PREF_EXCLUDE_TAGS
             title = "Tags to exclude from browse/search"
-            summary = "Separate tags with commas (,).\n" +
-                "Excluding: ${alwaysExcludeTags()}"
+            summary = "Separate tags with commas (,)."
         }.also(screen::addPreference)
 
         addRandomUAPreferenceToScreen(screen)
     }
 
-    // Corrected parseAs function
     private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
 
     companion object {
@@ -401,7 +238,6 @@ class Koharu(
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
-        // Added missing imports
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
     }
 }
