@@ -90,9 +90,9 @@ class Koharu(
 
     private val webViewCookieJar = WebViewCookieJar()
 
-    private val webView by lazy {
-        WebView(application).apply {
-            @SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun createWebView(): WebView {
+        return WebView(application).apply {
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
@@ -102,25 +102,32 @@ class Koharu(
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, url: String) {
                     super.onPageFinished(view, url)
-                    // **FIXED:** Inject a script that hooks localStorage.setItem instead of polling.
-                    // This is stealthier and less likely to be detected as bot activity.
-                    view.evaluateJavascript(
-                        """
-                        (function() {
-                            const originalSetItem = localStorage.setItem;
-                            localStorage.setItem = function(key, value) {
-                                if (key === 'clearance' && window.Android && typeof window.Android.onToken === 'function') {
-                                    window.Android.onToken(value);
+                    if (url == "$baseUrl/") {
+                        view.evaluateJavascript(
+                            """
+                            (function() {
+                                const originalSetItem = localStorage.setItem;
+                                localStorage.setItem = function(key, value) {
+                                    if (key === 'clearance' && window.Android && typeof window.Android.onToken === 'function') {
+                                        window.Android.onToken(value);
+                                    }
+                                    originalSetItem.apply(this, arguments);
+                                };
+                                // Also check if the token is already there when the page finishes loading
+                                const token = localStorage.getItem('clearance');
+                                if (token) {
+                                    window.Android.onToken(token);
                                 }
-                                originalSetItem.apply(this, arguments);
-                            };
-                        })();
-                        """.trimIndent(),
-                    ) { /* Do nothing with result */ }
+                            })();
+                            """.trimIndent(),
+                        ) { /* Do nothing with result */ }
+                    }
                 }
             }
         }
     }
+
+    private val webView by lazy { createWebView() }
 
     private var crtTokenLatch = CountDownLatch(0)
 
