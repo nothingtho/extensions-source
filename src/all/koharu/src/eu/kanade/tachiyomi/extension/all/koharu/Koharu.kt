@@ -11,10 +11,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
-import androidx.preference.EditTextPreference
-import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
-import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
 import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
 import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
@@ -30,9 +27,8 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.utils.getPreferencesLazy
 import kotlinx.serialization.json.Json
-import okhttp3.Headers
+import kotlinx.serialization.serializer
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -46,7 +42,7 @@ import java.util.Locale
 
 // This object is a diagnostic tool to test Cloudflare session stability.
 // It creates a WebView with settings designed to mimic a real browser as closely as possible.
-object DebugWebView {
+object DebugWebViewHelper {
     private const val TAG = "KOHARU_DEBUG_WEBVIEW"
     private val handler = Handler(Looper.getMainLooper())
 
@@ -83,9 +79,11 @@ object DebugWebView {
                     displayZoomControls = false
                 }
 
-                // Sync cookies from the app's client to the WebView
-                source.client.cookieJar.loadForRequest(url.toHttpUrl()).forEach {
-                    cookieManager.setCookie(url, it.toString())
+                // Pillar 3 (cont.): Session Inheritance - Manually sync cookies
+                val cookies = source.client.cookieJar.loadForRequest(url.toHttpUrl())
+                cookies.forEach { cookie ->
+                    cookieManager.setCookie(url, cookie.toString())
+                    Log.d(TAG, "Syncing cookie to WebView: ${cookie.name}=${cookie.value}")
                 }
 
                 webView.webViewClient = object : WebViewClient() {
@@ -98,7 +96,11 @@ object DebugWebView {
 
                 val dialog = android.app.AlertDialog.Builder(context)
                     .setView(webView)
-                    .setNegativeButton("Close") { dialog, _ -> dialog.dismiss() }
+                    .setNegativeButton("Close") { dialog, _ ->
+                        webView.stopLoading()
+                        webView.destroy()
+                        dialog.dismiss()
+                    }
                     .create()
 
                 dialog.show()
@@ -120,41 +122,14 @@ class Koharu(
     override val baseUrl = "https://niyaniya.moe"
     override val id = if (lang == "en") 1484902275639232927 else super.id
     private val apiUrl = "https://api.schale.network"
-    private val apiBooksUrl = "$apiUrl/books"
     override val supportsLatest = true
 
     private val json: Json by injectLazy()
     private val preferences: SharedPreferences by getPreferencesLazy()
 
-    private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
-    private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
-    private fun quality() = preferences.getString(PREF_IMAGERES, "1280")!!
-    private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
-    private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
-
-    private var _domainUrl: String? = null
-    private val domainUrl: String
-        get() = _domainUrl ?: run {
-            val domain = getDomain()
-            _domainUrl = domain
-            domain
-        }
-
-    private fun getDomain(): String {
-        try {
-            val noRedirectClient = network.client.newBuilder().followRedirects(false).build()
-            val host = noRedirectClient.newCall(GET(baseUrl, Headers.Builder().build())).execute()
-                .headers["Location"]?.toHttpUrlOrNull()?.host
-                ?: return baseUrl
-            return "https://$host"
-        } catch (_: Exception) {
-            return baseUrl
-        }
-    }
-
-    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-        .set("Referer", "$domainUrl/")
-        .set("Origin", domainUrl)
+    override fun headersBuilder() = super.headersBuilder()
+        .set("Referer", "$baseUrl/")
+        .set("Origin", baseUrl)
 
     override val client: OkHttpClient by lazy {
         network.cloudflareClient.newBuilder()
@@ -167,77 +142,50 @@ class Koharu(
             .build()
     }
 
-    // --- Start of Stripped-Down Code ---
+    // --- DIAGNOSTIC MODE ---
+    // The following functions are overridden to create a test flow.
 
-    // LATEST UPDATES & POPULAR: These will now serve as our trigger for the debug WebView.
-    override fun popularMangaRequest(page: Int): Request = GET(baseUrl, headers)
-    override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl, headers)
+    // 1. User opens "Popular" or "Latest". If blocked by CF, this throws an error,
+    //    prompting Tachiyomi to show the "Open in WebView" button.
+    override fun popularMangaRequest(page: Int): Request = GET(apiUrl, headers) // A dummy request to trigger CF
+    override fun latestUpdatesRequest(page: Int): Request = popularMangaRequest(page)
 
     override fun popularMangaParse(response: Response): MangasPage {
-        // We throw an exception here on purpose. This will show the "Open in WebView" button.
-        // After solving in WebView, refreshing again will trigger fetchMangaDetails.
-        throw IOException("Please solve Cloudflare in WebView first, then refresh again to open the debug WebView.")
+        // This will only be reached AFTER the user solves the initial CF challenge.
+        // We throw a custom exception to guide the user to the next step.
+        throw IOException("Cloudflare solved! Now tap any manga to open the debug WebView.")
     }
     override fun latestUpdatesParse(response: Response): MangasPage = popularMangaParse(response)
 
-    // DETAILS: This is now the entry point for our test.
+    // 2. After solving CF, the user taps on any manga from the (now visible) browse screen.
+    //    This function is hijacked to launch our highly-configured test WebView.
     override fun fetchMangaDetails(manga: SManga): Observable<SManga> {
-        // Instead of fetching details, we launch our debug WebView.
-        DebugWebView.openInDebugWebView(this, "$baseUrl${manga.url}")
-        // Return an empty observable because we are not actually fetching details.
-        return Observable.empty()
+        DebugWebViewHelper.openInDebugWebView(this, "$baseUrl${manga.url}")
+        return Observable.empty() // We don't return any real manga data.
     }
 
     // --- All other functions are disabled for this test ---
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = throw UnsupportedOperationException("Disabled for debug")
-    override fun searchMangaParse(response: Response): MangasPage = throw UnsupportedOperationException("Disabled for debug")
-    override fun mangaDetailsParse(response: Response): SManga = throw UnsupportedOperationException("Disabled for debug")
-    override fun chapterListParse(response: Response): List<SChapter> = throw UnsupportedOperationException("Disabled for debug")
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.error(UnsupportedOperationException("Disabled for debug"))
-    override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException("Disabled for debug")
-    override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException("Disabled for debug")
-    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException("Disabled for debug")
-
-    // --- Boilerplate and Settings (unchanged) ---
-
-    override fun getFilterList(): FilterList = FilterList() // Disabled for now
-    private val scope = CoroutineScope(Dispatchers.IO)
-    private fun launchIO(block: () -> Unit) = scope.launch { block() }
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = throw UnsupportedOperationException("Disabled for this test")
+    override fun searchMangaParse(response: Response): MangasPage = throw UnsupportedOperationException("Disabled for this test")
+    override fun mangaDetailsParse(response: Response): SManga = throw UnsupportedOperationException("Disabled for this test")
+    override fun chapterListParse(response: Response): List<SChapter> = throw UnsupportedOperationException("Disabled for this test")
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.error(UnsupportedOperationException("Disabled for this test"))
+    override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException("Disabled for this test")
+    override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException("Disabled for this test")
+    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException("Disabled for this test")
+    override fun getFilterList(): FilterList = FilterList()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        ListPreference(screen.context).apply {
-            key = PREF_IMAGERES
-            title = "Image Resolution"
-            entries = arrayOf("780x", "980x", "1280x", "1600x", "Original")
-            entryValues = arrayOf("780", "980", "1280", "1600", "0")
-            summary = "%s"
-            setDefaultValue("1280")
-        }.also(screen::addPreference)
-
-        SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_REM_ADD
-            title = "Remove additional information in title"
-            summary = "Remove anything in brackets from manga titles."
-            setDefaultValue(false)
-        }.also(screen::addPreference)
-
-        EditTextPreference(screen.context).apply {
-            key = PREF_EXCLUDE_TAGS
-            title = "Tags to exclude from browse/search"
-            summary = "Separate tags with commas (,)."
-        }.also(screen::addPreference)
-
+        // Minimal preferences for testing
         addRandomUAPreferenceToScreen(screen)
     }
 
-    private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
+    private inline fun <reified T> Response.parseAs(): T {
+        val responseBody = this.body.string()
+        return json.decodeFromString(json.serializersModule.serializer(), responseBody)
+    }
 
     companion object {
-        const val PREFIX_ID_KEY_SEARCH = "id:"
-        private const val PREF_IMAGERES = "pref_image_quality"
-        private const val PREF_REM_ADD = "pref_remove_additional"
-        private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
-        internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
+        // Minimal companion object for now
     }
 }
