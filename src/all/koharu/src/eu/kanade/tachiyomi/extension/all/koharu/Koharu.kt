@@ -91,47 +91,52 @@ class Koharu(
     private val webViewCookieJar = WebViewCookieJar()
 
     private val webView by lazy {
-        @SuppressLint("SetJavaScriptEnabled")
+        @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
         class JsObject(private val latch: CountDownLatch) {
             @JavascriptInterface
             fun onToken(token: String?) {
                 if (token != null) {
-                    preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
-                    latch.countDown()
+                    // Make sure token is not empty or "null" string
+                    if (token.isNotEmpty() && token != "null") {
+                        preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
+                        latch.countDown()
+                    }
                 }
             }
         }
 
-        val webview = WebView(application)
-        webview.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            databaseEnabled = true
-            userAgentString = network.client.newCall(GET(baseUrl)).execute().request.header("User-Agent")
-        }
-        webview.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView, url: String) {
-                super.onPageFinished(view, url)
-                if (url == "$baseUrl/") {
-                    view.evaluateJavascript(
-                        """
-                        (function() {
-                            const checkToken = () => {
-                                const token = localStorage.getItem('clearance');
-                                if (token) {
-                                    Android.onToken(token);
-                                } else {
-                                    setTimeout(checkToken, 500);
-                                }
-                            };
-                            checkToken();
-                        })();
-                        """.trimIndent(),
-                    ) { /* Do nothing with result */ }
+        WebView(application).apply {
+            settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                databaseEnabled = true
+                // **FIXED:** Use the static User-Agent string provided by the user
+                userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+            }
+            webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView, url: String) {
+                    super.onPageFinished(view, url)
+                    if (url == "$baseUrl/") {
+                        // Continuously check for the token in localStorage
+                        view.evaluateJavascript(
+                            """
+                            (function() {
+                                const checkToken = () => {
+                                    const token = localStorage.getItem('clearance');
+                                    if (token) {
+                                        Android.onToken(token);
+                                    } else {
+                                        setTimeout(checkToken, 500);
+                                    }
+                                };
+                                checkToken();
+                            })();
+                            """.trimIndent(),
+                        ) { /* Do nothing with result */ }
+                    }
                 }
             }
         }
-        webview
     }
 
     private var crtTokenLatch = CountDownLatch(0)
@@ -193,18 +198,19 @@ class Koharu(
             crtTokenLatch = CountDownLatch(1)
             val handler = Handler(Looper.getMainLooper())
 
-            handler.post {
-                Toast.makeText(application, "Attempting to get clearance token...", Toast.LENGTH_SHORT).show()
-                @SuppressLint("AddJavascriptInterface")
-                class JsObject(private val latch: CountDownLatch) {
-                    @JavascriptInterface
-                    fun onToken(token: String?) {
-                        if (token != null) {
-                            preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
-                            latch.countDown()
-                        }
+            @SuppressLint("AddJavascriptInterface")
+            class JsObject(private val latch: CountDownLatch) {
+                @JavascriptInterface
+                fun onToken(token: String?) {
+                    if (token != null && token.isNotEmpty() && token != "null") {
+                        preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
+                        latch.countDown()
                     }
                 }
+            }
+
+            handler.post {
+                Toast.makeText(application, "Attempting to get clearance token...", Toast.LENGTH_SHORT).show()
                 webView.addJavascriptInterface(JsObject(crtTokenLatch), "Android")
                 webView.loadUrl(baseUrl)
             }
@@ -522,7 +528,7 @@ class Koharu(
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
-        private const val PREF_CRT_TOKEN = "pref_clearance_token" // Renamed for clarity
+        private const val PREF_CRT_TOKEN = "pref_clearance_token"
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
     }
 }
