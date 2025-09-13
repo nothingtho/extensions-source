@@ -1,12 +1,9 @@
+// FILE: src/all/koharu/Koharu.kt
+
 package eu.kanade.tachiyomi.extension.all.koharu
 
-import android.annotation.SuppressLint
 import android.app.Application
 import android.content.SharedPreferences
-import android.os.Handler
-import android.os.Looper
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -40,16 +37,16 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
-import uy.kohesive.injekt.injectLazy
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 class Koharu(
     override val lang: String = "all",
@@ -66,87 +63,51 @@ class Koharu(
 
     override val supportsLatest = true
 
-    private val json: Json by injectLazy()
+    private val json: Json by lazy { Injekt.get() }
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
+    private val webviewRequiredMessage = "Open in WebView to solve the Cloudflare challenge."
+
+    private fun clearanceTokenInterceptor() = Interceptor { chain ->
+        val originalRequest = chain.request()
+
+        val clearanceToken = preferences.getString(PREF_CLEARANCE_TOKEN, null)
+            ?: throw IOException(webviewRequiredMessage)
+
+        val newUrl = originalRequest.url.newBuilder()
+            .addQueryParameter("crt", clearanceToken)
+            .build()
+
+        val newRequest = originalRequest.newBuilder()
+            .url(newUrl)
+            .build()
+
+        val response = chain.proceed(newRequest)
+
+        // If token is invalid, clear it and prompt user to solve challenge again.
+        if (response.code in listOf(401, 403)) {
+            response.close()
+            preferences.edit().remove(PREF_CLEARANCE_TOKEN).apply()
+            throw IOException(webviewRequiredMessage)
+        }
+
+        response
+    }
+
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .addInterceptor(clearanceTokenInterceptor())
+        .rateLimit(3)
+        .build()
+
     private fun quality() = preferences.getString(PREF_IMAGERES, "1280")!!
 
     private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
 
     private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
-
-    private val lazyHeaders by lazy {
-        headersBuilder()
-            .set("Referer", "$baseUrl/")
-            .set("Origin", baseUrl)
-            .build()
-    }
-
-    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .rateLimit(3)
-        .build()
-
-    private val clearanceClient = network.cloudflareClient.newBuilder()
-        .addInterceptor { chain ->
-            val request = chain.request()
-            val url = request.url
-            val clearance = getClearance()
-                ?: throw IOException("Open webview to refresh token")
-
-            val newUrl = url.newBuilder()
-                .setQueryParameter("crt", clearance)
-                .build()
-            val newRequest = request.newBuilder()
-                .url(newUrl)
-                .build()
-
-            val response = chain.proceed(newRequest)
-
-            if (response.code !in listOf(400, 403)) {
-                return@addInterceptor response
-            }
-            response.close()
-            _clearance = null
-            throw IOException("Open webview to refresh token")
-        }
-        .rateLimit(3)
-        .build()
-
-    private val context: Application by injectLazy()
-    private val handler by lazy { Handler(Looper.getMainLooper()) }
-    private var _clearance: String? = null
-
-    @SuppressLint("SetJavaScriptEnabled")
-    fun getClearance(): String? {
-        _clearance?.also { return it }
-        val latch = CountDownLatch(1)
-        handler.post {
-            val webview = WebView(context)
-            with(webview.settings) {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                databaseEnabled = true
-                blockNetworkImage = true
-            }
-            webview.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    view!!.evaluateJavascript("window.localStorage.getItem('clearance')") { clearance ->
-                        webview.stopLoading()
-                        webview.destroy()
-                        _clearance = clearance.takeUnless { it == "null" }?.removeSurrounding("\"")
-                        latch.countDown()
-                    }
-                }
-            }
-            webview.loadUrl("$baseUrl/")
-        }
-        latch.await(10, TimeUnit.SECONDS)
-        return _clearance
-    }
 
     private fun getManga(book: Entry) = SManga.create().apply {
         setUrlWithoutDomain("${book.id}/${book.key}")
@@ -188,12 +149,9 @@ class Koharu(
             else -> "0"
         }
 
-        val imagesResponse = clearanceClient.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", lazyHeaders)).execute()
-        val images = imagesResponse.parseAs<ImagesInfo>() to realQuality
-        return images
+        val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", headers)).execute()
+        return imagesResponse.parseAs<ImagesInfo>() to realQuality
     }
-
-    // Latest
 
     override fun latestUpdatesRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
@@ -208,12 +166,10 @@ class Koharu(
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
-        lazyHeaders,
+        headers,
     )
 
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
-
-    // Popular
 
     override fun popularMangaRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
@@ -229,7 +185,7 @@ class Koharu(
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
-        lazyHeaders,
+        headers,
     )
 
     override fun popularMangaParse(response: Response): MangasPage {
@@ -237,16 +193,15 @@ class Koharu(
         return MangasPage(data.entries.map(::getManga), data.page * data.limit < data.total)
     }
 
-    // Search
-
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
         return when {
             query.startsWith(PREFIX_ID_KEY_SEARCH) -> {
                 val ipk = query.removePrefix(PREFIX_ID_KEY_SEARCH)
-                val response = client.newCall(GET("$apiBooksUrl/detail/$ipk", lazyHeaders)).execute()
-                Observable.just(
-                    MangasPage(listOf(mangaDetailsParse(response)), false),
-                )
+                Observable.fromCallable {
+                    client.newCall(GET("$apiBooksUrl/detail/$ipk", headers)).execute()
+                }.map { response ->
+                    MangasPage(listOf(mangaDetailsParse(response)), false)
+                }
             }
             else -> super.fetchSearchManga(page, query, filters)
         }
@@ -268,29 +223,21 @@ class Koharu(
             filters.forEach { filter ->
                 when (filter) {
                     is KoharuFilters.SortFilter -> addQueryParameter("sort", filter.getValue())
-
                     is KoharuFilters.CategoryFilter -> {
                         val activeFilter = filter.state.filter { it.state }
                         if (activeFilter.isNotEmpty()) {
                             addQueryParameter("cat", activeFilter.sumOf { it.value }.toString())
                         }
                     }
-
                     is KoharuFilters.TagFilter -> {
-                        includedTags += filter.state
-                            .filter { it.isIncluded() }
-                            .map { it.id }
-                        excludedTags += filter.state
-                            .filter { it.isExcluded() }
-                            .map { it.id }
+                        includedTags += filter.state.filter { it.isIncluded() }.map { it.id }
+                        excludedTags += filter.state.filter { it.isExcluded() }.map { it.id }
                     }
-
                     is KoharuFilters.GenreConditionFilter -> {
                         if (filter.state > 0) {
                             addQueryParameter(filter.param, filter.toUriPart())
                         }
                     }
-
                     is KoharuFilters.TextFilter -> {
                         if (filter.state.isNotEmpty()) {
                             val tags = filter.state.split(",").filter(String::isNotBlank).joinToString(",")
@@ -303,26 +250,20 @@ class Koharu(
                 }
             }
 
-            if (includedTags.isNotEmpty()) {
-                addQueryParameter("include", includedTags.joinToString(","))
-            }
-            if (excludedTags.isNotEmpty()) {
-                addQueryParameter("exclude", excludedTags.joinToString(","))
-            }
+            if (includedTags.isNotEmpty()) addQueryParameter("include", includedTags.joinToString(","))
+            if (excludedTags.isNotEmpty()) addQueryParameter("exclude", excludedTags.joinToString(","))
 
             if (query.isNotEmpty()) terms.add("title:\"$query\"")
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
             addQueryParameter("page", page.toString())
         }.build()
-
-        return GET(url, lazyHeaders)
+        return GET(url, headers)
     }
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
     override fun getFilterList(): FilterList {
         launchIO { fetchTags() }
-
         return getFilters()
     }
 
@@ -330,19 +271,12 @@ class Koharu(
 
     private fun launchIO(block: () -> Unit) = scope.launch { block() }
 
-    /**
-     * Fetch the genres from the source to be used in the filters.
-     */
     private fun fetchTags() {
         if (tagsFetchAttempts < 3 && !tagsFetched) {
             try {
-                client.newCall(
-                    GET("$apiBooksUrl/tags/filters", lazyHeaders),
-                ).execute()
+                client.newCall(GET("$apiBooksUrl/tags/filters", headers)).execute()
                     .use { it.parseAs<List<Filter>>() }
-                    .also {
-                        tagsFetched = true
-                    }
+                    .also { tagsFetched = true }
                     .takeIf { it.isNotEmpty() }
                     ?.map { it.toTag() }
                     ?.also { tags ->
@@ -362,10 +296,8 @@ class Koharu(
         }
     }
 
-    // Details
-
     override fun mangaDetailsRequest(manga: SManga): Request {
-        return GET("$apiBooksUrl/detail/${manga.url}", lazyHeaders)
+        return GET("$apiBooksUrl/detail/${manga.url}", headers)
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
@@ -378,10 +310,8 @@ class Koharu(
 
     override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
 
-    // Chapter
-
     override fun chapterListRequest(manga: SManga): Request {
-        return GET("$apiBooksUrl/detail/${manga.url}", lazyHeaders)
+        return GET("$apiBooksUrl/detail/${manga.url}", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -397,10 +327,8 @@ class Koharu(
 
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
 
-    // Page List
-
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return clearanceClient.newCall(pageListRequest(chapter))
+        return client.newCall(pageListRequest(chapter))
             .asObservableSuccess()
             .map { response ->
                 pageListParse(response)
@@ -408,15 +336,16 @@ class Koharu(
     }
 
     override fun pageListRequest(chapter: SChapter): Request {
-        return POST("$apiBooksUrl/detail/${chapter.url}", lazyHeaders)
+        return POST("$apiBooksUrl/detail/${chapter.url}", headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
         val mangaData = response.parseAs<MangaData>()
         val url = response.request.url.toString()
         val matches = Regex("""/detail/(\d+)/([a-z\d]+)""").find(url)
-        if (matches == null || matches.groupValues.size < 3) return emptyList()
-        val imagesInfo = getImagesByMangaData(mangaData, matches.groupValues[1], matches.groupValues[2])
+            ?: return emptyList()
+        val (entryId, entryKey) = matches.destructured
+        val imagesInfo = getImagesByMangaData(mangaData, entryId, entryKey)
 
         return imagesInfo.first.entries.mapIndexed { index, image ->
             Page(index, imageUrl = "${imagesInfo.first.base}/${image.path}?w=${imagesInfo.second}")
@@ -424,12 +353,10 @@ class Koharu(
     }
 
     override fun imageRequest(page: Page): Request {
-        return GET(page.imageUrl!!, lazyHeaders)
+        return GET(page.imageUrl!!, headers)
     }
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
-
-    // Settings
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
@@ -466,6 +393,7 @@ class Koharu(
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
+        const val PREF_CLEARANCE_TOKEN = "pref_clearance_token"
 
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
     }
