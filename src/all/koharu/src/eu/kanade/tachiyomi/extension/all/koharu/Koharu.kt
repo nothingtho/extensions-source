@@ -42,8 +42,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
+import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -63,27 +62,34 @@ class Koharu(
 
     override val supportsLatest = true
 
-    private val json: Json by lazy { Injekt.get() }
-
-    private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
-    private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
+    private val json: Json by injectLazy()
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
     private val webviewRequiredMessage = "Open in WebView to solve the Cloudflare challenge."
 
-    private fun clearanceTokenInterceptor() = Interceptor { chain ->
+    /**
+     * This interceptor solves the "dementia" problem.
+     * It reads the token AND the User-Agent saved from the WebView.
+     * It then applies both to every API request, creating a unified identity.
+     */
+    private fun clearanceInterceptor() = Interceptor { chain ->
         val originalRequest = chain.request()
 
         val clearanceToken = preferences.getString(PREF_CLEARANCE_TOKEN, null)
-            ?: throw IOException(webviewRequiredMessage)
+        val userAgent = preferences.getString(PREF_USER_AGENT, null)
 
-        val newUrl = originalRequest.url.newBuilder()
-            .addQueryParameter("crt", clearanceToken)
-            .build()
+        if (clearanceToken == null || userAgent == null) {
+            throw IOException(webviewRequiredMessage)
+        }
 
         val newRequest = originalRequest.newBuilder()
-            .url(newUrl)
+            .url(
+                originalRequest.url.newBuilder()
+                    .addQueryParameter("crt", clearanceToken)
+                    .build(),
+            )
+            .header("User-Agent", userAgent) // Use the saved User-Agent
             .build()
 
         val response = chain.proceed(newRequest)
@@ -91,7 +97,10 @@ class Koharu(
         // If token is invalid, clear it and prompt user to solve challenge again.
         if (response.code in listOf(401, 403)) {
             response.close()
-            preferences.edit().remove(PREF_CLEARANCE_TOKEN).apply()
+            preferences.edit()
+                .remove(PREF_CLEARANCE_TOKEN)
+                .remove(PREF_USER_AGENT)
+                .apply()
             throw IOException(webviewRequiredMessage)
         }
 
@@ -99,14 +108,18 @@ class Koharu(
     }
 
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .addInterceptor(clearanceTokenInterceptor())
+        .addInterceptor(clearanceInterceptor())
         .rateLimit(3)
         .build()
 
+    // The old client for requests that didn't need the token is no longer necessary.
+    // The interceptor will handle everything.
+
+    private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
+    private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
+
     private fun quality() = preferences.getString(PREF_IMAGERES, "1280")!!
-
     private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
-
     private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
 
     private fun getManga(book: Entry) = SManga.create().apply {
@@ -156,7 +169,6 @@ class Koharu(
     override fun latestUpdatesRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
-
             val terms: MutableList<String> = mutableListOf()
             if (lang != "all") terms += "language:\"^$searchLang$\""
             val alwaysExcludeTags = alwaysExcludeTags()?.split(",")
@@ -175,7 +187,6 @@ class Koharu(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
             addQueryParameter("sort", "8")
             addQueryParameter("page", page.toString())
-
             val terms: MutableList<String> = mutableListOf()
             if (lang != "all") terms += "language:\"^$searchLang$\""
             val alwaysExcludeTags = alwaysExcludeTags()?.split(",")
@@ -212,14 +223,12 @@ class Koharu(
             val terms: MutableList<String> = mutableListOf()
             val includedTags: MutableList<Int> = mutableListOf()
             val excludedTags: MutableList<Int> = mutableListOf()
-
             if (lang != "all") terms += "language:\"^$searchLang$\""
             val alwaysExcludeTags = alwaysExcludeTags()?.split(",")
                 ?.map { it.trim() }?.filter(String::isNotBlank) ?: emptyList()
             if (alwaysExcludeTags.isNotEmpty()) {
                 terms += "tag:\"${alwaysExcludeTags.joinToString(",") { "-$it" }}\""
             }
-
             filters.forEach { filter ->
                 when (filter) {
                     is KoharuFilters.SortFilter -> addQueryParameter("sort", filter.getValue())
@@ -249,10 +258,8 @@ class Koharu(
                     else -> {}
                 }
             }
-
             if (includedTags.isNotEmpty()) addQueryParameter("include", includedTags.joinToString(","))
             if (excludedTags.isNotEmpty()) addQueryParameter("exclude", excludedTags.joinToString(","))
-
             if (query.isNotEmpty()) terms.add("title:\"$query\"")
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
             addQueryParameter("page", page.toString())
@@ -268,13 +275,13 @@ class Koharu(
     }
 
     private val scope = CoroutineScope(Dispatchers.IO)
-
     private fun launchIO(block: () -> Unit) = scope.launch { block() }
 
     private fun fetchTags() {
         if (tagsFetchAttempts < 3 && !tagsFetched) {
             try {
-                client.newCall(GET("$apiBooksUrl/tags/filters", headers)).execute()
+                // Use the base client for fetching tags as it might not need clearance
+                network.client.newCall(GET("$apiBooksUrl/tags/filters", headers)).execute()
                     .use { it.parseAs<List<Filter>>() }
                     .also { tagsFetched = true }
                     .takeIf { it.isNotEmpty() }
@@ -346,7 +353,6 @@ class Koharu(
             ?: return emptyList()
         val (entryId, entryKey) = matches.destructured
         val imagesInfo = getImagesByMangaData(mangaData, entryId, entryKey)
-
         return imagesInfo.first.entries.mapIndexed { index, image ->
             Page(index, imageUrl = "${imagesInfo.first.base}/${image.path}?w=${imagesInfo.second}")
         }
@@ -394,7 +400,7 @@ class Koharu(
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
         const val PREF_CLEARANCE_TOKEN = "pref_clearance_token"
-
+        const val PREF_USER_AGENT = "pref_user_agent"
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
     }
 }
