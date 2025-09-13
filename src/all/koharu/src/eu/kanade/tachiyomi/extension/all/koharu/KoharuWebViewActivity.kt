@@ -24,23 +24,22 @@ class KoharuWebViewActivity : Activity() {
 
         webView.settings.javaScriptEnabled = true
         webView.settings.domStorageEnabled = true
+        webView.settings.userAgentString = source.headers["User-Agent"] // Use the source's user agent
 
         // Create a bridge for JavaScript to call our Kotlin code
-        webView.addJavascriptInterface(JSInterface(), "Android")
+        webView.addJavascriptInterface(JSInterface(this), "Android")
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String?) {
-                // This JavaScript code will run after the page loads.
-                // It sets up an interval to check localStorage every half-second.
-                // When it finds the 'clearance' token, it passes it to our Android app and stops.
+                // This script waits for the clearance token and then passes it AND the user agent back.
                 val js = """
                     (function() {
                         const interval = setInterval(function() {
                             const token = localStorage.getItem('clearance');
                             if (token) {
                                 clearInterval(interval);
-                                // The token is found! Pass it to our JSInterface.
-                                Android.passToken(token);
+                                const userAgent = navigator.userAgent;
+                                Android.passClearanceData(token, userAgent);
                             }
                         }, 500);
                     })();
@@ -49,19 +48,17 @@ class KoharuWebViewActivity : Activity() {
             }
         }
 
-        // Load the website. The user will solve the Turnstile CAPTCHA here.
         webView.loadUrl(source.baseUrl)
     }
 
-    // This is the Kotlin class that the JavaScript code will call.
-    inner class JSInterface {
+    inner class JSInterface(private val activity: Activity) {
         @JavascriptInterface
-        fun passToken(token: String) {
+        fun passClearanceData(token: String, userAgent: String) {
             val intent = Intent()
-            // The token from JS has extra quotes, so we remove them.
             intent.putExtra("token", token.removeSurrounding("\""))
-            setResult(Activity.RESULT_OK, intent)
-            finish() // Close the WebView activity
+            intent.putExtra("userAgent", userAgent)
+            activity.setResult(Activity.RESULT_OK, intent)
+            activity.finish()
         }
     }
 }
