@@ -2,7 +2,6 @@
 
 package eu.kanade.tachiyomi.extension.all.koharu
 
-import android.app.Application
 import android.content.SharedPreferences
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
@@ -68,11 +67,6 @@ class Koharu(
 
     private val webviewRequiredMessage = "Open in WebView to solve the Cloudflare challenge."
 
-    /**
-     * This interceptor solves the "dementia" problem.
-     * It reads the token AND the User-Agent saved from the WebView.
-     * It then applies both to every API request, creating a unified identity.
-     */
     private fun clearanceInterceptor() = Interceptor { chain ->
         val originalRequest = chain.request()
 
@@ -89,12 +83,11 @@ class Koharu(
                     .addQueryParameter("crt", clearanceToken)
                     .build(),
             )
-            .header("User-Agent", userAgent) // Use the saved User-Agent
+            .header("User-Agent", userAgent)
             .build()
 
         val response = chain.proceed(newRequest)
 
-        // If token is invalid, clear it and prompt user to solve challenge again.
         if (response.code in listOf(401, 403)) {
             response.close()
             preferences.edit()
@@ -111,9 +104,6 @@ class Koharu(
         .addInterceptor(clearanceInterceptor())
         .rateLimit(3)
         .build()
-
-    // The old client for requests that didn't need the token is no longer necessary.
-    // The interceptor will handle everything.
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
@@ -280,7 +270,6 @@ class Koharu(
     private fun fetchTags() {
         if (tagsFetchAttempts < 3 && !tagsFetched) {
             try {
-                // Use the base client for fetching tags as it might not need clearance
                 network.client.newCall(GET("$apiBooksUrl/tags/filters", headers)).execute()
                     .use { it.parseAs<List<Filter>>() }
                     .also { tagsFetched = true }
