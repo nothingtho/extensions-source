@@ -75,6 +75,9 @@ class Koharu(
     private val preferences: SharedPreferences by lazy { Injekt.get<Application>().getSharedPreferences("source_$id", 0) }
     private val application: Application by injectLazy()
 
+    private val userAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+    override fun headersBuilder() = super.headersBuilder().set("User-Agent", userAgent)
+
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
     private fun quality() = preferences.getString(PREF_IMAGERES, "1280")!!
@@ -97,7 +100,7 @@ class Koharu(
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 databaseEnabled = true
-                userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+                userAgentString = this@Koharu.userAgent // Ensure consistency
             }
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, url: String) {
@@ -113,20 +116,18 @@ class Koharu(
                                     }
                                     originalSetItem.apply(this, arguments);
                                 };
-                                // Also check if the token is already there when the page finishes loading
                                 const token = localStorage.getItem('clearance');
                                 if (token) {
                                     window.Android.onToken(token);
                                 }
                             })();
                             """.trimIndent(),
-                        ) { /* Do nothing with result */ }
+                        ) { /* Do nothing */ }
                     }
                 }
             }
         }
     }
-
     private val webView by lazy { createWebView() }
 
     private var crtTokenLatch = CountDownLatch(0)
@@ -134,41 +135,55 @@ class Koharu(
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
             .cookieJar(webViewCookieJar)
-            .addInterceptor(CloudflareInterceptor())
-            .addInterceptor(CrtInterceptor())
+            .addInterceptor(ClearanceInterceptor())
             .rateLimit(3)
             .build()
     }
 
-    private inner class CrtInterceptor : Interceptor {
+    private inner class ClearanceInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val originalRequest = chain.request()
-            if (!originalRequest.url.toString().startsWith(apiUrl)) {
-                return chain.proceed(originalRequest)
-            }
 
+            // Step 1: Add CRT token if available and it's an API request
             val crt = preferences.getString(PREF_CRT_TOKEN, null)
-            if (crt == null) {
-                return handleCrtRequest(originalRequest, chain)
+            val request = if (crt != null && originalRequest.url.toString().startsWith(apiUrl)) {
+                val newUrl = originalRequest.url.newBuilder()
+                    .addQueryParameter("crt", crt)
+                    .build()
+                originalRequest.newBuilder().url(newUrl).build()
+            } else {
+                originalRequest
             }
 
-            val newUrl = originalRequest.url.newBuilder()
-                .addQueryParameter("crt", crt)
-                .build()
-            val newRequest = originalRequest.newBuilder().url(newUrl).build()
-            val response = chain.proceed(newRequest)
+            // Step 2: Proceed with the request
+            val response = chain.proceed(request)
 
-            if (response.code in listOf(401, 403)) {
-                response.close()
-                preferences.edit().remove(PREF_CRT_TOKEN).apply()
-                return handleCrtRequest(originalRequest, chain)
+            // Step 3: Analyze the response for security challenges
+            when {
+                // Case A: Cloudflare browser check failed (needs cf_clearance cookie)
+                response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true -> {
+                    response.close()
+                    // This is Gate 1. Force user to solve the initial challenge.
+                    throw IOException("Cloudflare challenge required. Please open in WebView, solve the puzzle, and then retry.")
+                }
+                // Case B: API rejected the request (likely missing or invalid CRT token)
+                response.code in listOf(401, 403) && request.url.toString().startsWith(apiUrl) -> {
+                    response.close()
+                    // This is Gate 2. We passed Cloudflare but need a new CRT.
+                    return handleCrtRefreshAndRetry(originalRequest, chain)
+                }
             }
+
             return response
         }
 
         @SuppressLint("AddJavascriptInterface")
         @Synchronized
-        private fun handleCrtRequest(request: Request, chain: Interceptor.Chain): Response {
+        private fun handleCrtRefreshAndRetry(request: Request, chain: Interceptor.Chain): Response {
+            // Invalidate old token
+            preferences.edit().remove(PREF_CRT_TOKEN).apply()
+
+            // Check if another thread already got the token while we were waiting
             val currentToken = preferences.getString(PREF_CRT_TOKEN, null)
             if (currentToken != null) {
                 val newUrl = request.url.newBuilder()
@@ -200,24 +215,12 @@ class Koharu(
             handler.post { webView.removeJavascriptInterface("Android") }
 
             val newCrt = preferences.getString(PREF_CRT_TOKEN, null)
-                ?: throw IOException("Failed to get clearance token. Open in WebView, solve challenge, and retry.")
+                ?: throw IOException("Failed to get clearance token. WebView process timed out or failed.")
 
             val newUrl = request.url.newBuilder()
                 .addQueryParameter("crt", newCrt)
                 .build()
             return chain.proceed(request.newBuilder().url(newUrl).build())
-        }
-    }
-
-    private inner class CloudflareInterceptor : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val request = chain.request()
-            val response = chain.proceed(request)
-            if (response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true) {
-                response.close()
-                throw IOException("Cloudflare challenge required. Please open in WebView, solve the puzzle, and then retry.")
-            }
-            return response
         }
     }
 
