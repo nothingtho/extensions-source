@@ -28,7 +28,7 @@
             android:name=".all.koharu.KoharuWebViewActivity"
             android:configChanges="orientation|screenSize"
             android:exported="false"
-            android:theme="@style/Theme.Tachiyomi.NoActionBar"
+            android:theme="@android:style/Theme.NoTitleBar"
             android:label="Cloudflare Challenge" />
 
     </application>
