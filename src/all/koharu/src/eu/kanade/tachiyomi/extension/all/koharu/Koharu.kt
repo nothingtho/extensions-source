@@ -5,11 +5,8 @@ import android.app.Application
 import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
-import android.webkit.CookieManager
-import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -36,28 +33,23 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
+import keiyoushi.utils.getPreferencesLazy
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
-import okhttp3.Cookie
-import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import kotlin.reflect.KProperty
 
 class Koharu(
     override val lang: String = "all",
@@ -65,227 +57,96 @@ class Koharu(
 ) : HttpSource(), ConfigurableSource {
 
     override val name = "Niyaniya"
+
     override val baseUrl = "https://niyaniya.moe"
-    override val id = if (lang == "en") 1484902275639232927 else super.id
+
     private val apiUrl = "https://api.schale.network"
+
     private val apiBooksUrl = "$apiUrl/books"
+
     override val supportsLatest = true
 
     private val json: Json by injectLazy()
-    private val preferences: SharedPreferences by lazy { Injekt.get<Application>().getSharedPreferences("source_$id", 0) }
-    private val application: Application by injectLazy()
-
-    private val staticUserAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
-    override fun headersBuilder() = super.headersBuilder().apply {
-        if (preferences.getBoolean(PREF_USER_AGENT_SWITCH, false)) {
-            set("User-Agent", staticUserAgent)
-        }
-    }
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = replace(shortenTitleRegex, "").trim()
+
+    private val preferences: SharedPreferences by getPreferencesLazy()
+
     private fun quality() = preferences.getString(PREF_IMAGERES, "1280")!!
+
     private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
+
     private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
 
-    private fun apiHeaders(): Headers {
-        return headersBuilder()
+    private val lazyHeaders by lazy {
+        headersBuilder()
             .set("Referer", "$baseUrl/")
             .set("Origin", baseUrl)
             .build()
     }
 
-    private val webViewCookieJar by lazy { WebViewCookieJar(preferences.getBoolean(PREF_COOKIE_FLUSH, false)) }
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .rateLimit(3)
+        .build()
+
+    private val clearanceClient = network.cloudflareClient.newBuilder()
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val url = request.url
+            val clearance = getClearance()
+                ?: throw IOException("Open webview to refresh token")
+
+            val newUrl = url.newBuilder()
+                .setQueryParameter("crt", clearance)
+                .build()
+            val newRequest = request.newBuilder()
+                .url(newUrl)
+                .build()
+
+            val response = chain.proceed(newRequest)
+
+            if (response.code !in listOf(400, 403)) {
+                return@addInterceptor response
+            }
+            response.close()
+            _clearance = null
+            throw IOException("Open webview to refresh token")
+        }
+        .rateLimit(3)
+        .build()
+
+    private val context: Application by injectLazy()
+    private val handler by lazy { Handler(Looper.getMainLooper()) }
+    private var _clearance: String? = null
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun createWebView(): WebView {
-        return WebView(application).apply {
-            settings.apply {
+    fun getClearance(): String? {
+        _clearance?.also { return it }
+        val latch = CountDownLatch(1)
+        handler.post {
+            val webview = WebView(context)
+            with(webview.settings) {
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 databaseEnabled = true
-                userAgentString = if (preferences.getBoolean(PREF_USER_AGENT_SWITCH, false)) {
-                    staticUserAgent
-                } else {
-                    // Fallback to default in case something goes wrong, avoids crash
-                    System.getProperty("http.agent") ?: ""
-                }
+                blockNetworkImage = true
             }
-            webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView, url: String) {
-                    super.onPageFinished(view, url)
-                    if (url == "$baseUrl/") {
-                        view.evaluateJavascript(
-                            """
-                            (function() {
-                                const originalSetItem = localStorage.setItem;
-                                localStorage.setItem = function(key, value) {
-                                    if (key === 'clearance' && window.Android && typeof window.Android.onToken === 'function') {
-                                        window.Android.onToken(value);
-                                    }
-                                    originalSetItem.apply(this, arguments);
-                                };
-                                const token = localStorage.getItem('clearance');
-                                if (token) {
-                                    window.Android.onToken(token);
-                                }
-                            })();
-                            """.trimIndent(),
-                        ) { /* Do nothing */ }
-                    }
-                }
-            }
-        }
-    }
-    private val webView by lazy { createWebView() }
-
-    private var crtTokenLatch = CountDownLatch(0)
-
-    override val client: OkHttpClient by lazy {
-        val builder = network.client.newBuilder()
-            .cookieJar(webViewCookieJar)
-            .rateLimit(3)
-
-        if (preferences.getBoolean(PREF_ENABLE_FIXES, false)) {
-            builder.addInterceptor(ClearanceInterceptor())
-        } else {
-            builder.addInterceptor(CloudflareInterceptorOriginal())
-            builder.addInterceptor(CrtInterceptorOriginal())
-        }
-
-        builder.build()
-    }
-
-    // --- Start of New, Toggled Logic ---
-
-    private inner class ClearanceInterceptor : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val originalRequest = chain.request()
-
-            val crt = preferences.getString(PREF_CRT_TOKEN, null)
-            val request = if (crt != null && originalRequest.url.toString().startsWith(apiUrl)) {
-                val newUrl = originalRequest.url.newBuilder()
-                    .addQueryParameter("crt", crt)
-                    .build()
-                originalRequest.newBuilder().url(newUrl).build()
-            } else {
-                originalRequest
-            }
-
-            val response = chain.proceed(request)
-
-            when {
-                response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true -> {
-                    response.close()
-                    throw IOException("Cloudflare challenge required. Please open in WebView, solve the puzzle, and then retry.")
-                }
-                response.code in listOf(401, 403) && request.url.toString().startsWith(apiUrl) -> {
-                    response.close()
-                    if (preferences.getBoolean(PREF_AUTO_CRT_FETCH, false)) {
-                        return handleCrtRefreshAndRetry(originalRequest, chain)
-                    } else {
-                        throw IOException("Clearance token is invalid or expired. Enable automatic fetching or clear cookies and retry.")
-                    }
-                }
-            }
-
-            return response
-        }
-
-        @SuppressLint("AddJavascriptInterface")
-        @Synchronized
-        private fun handleCrtRefreshAndRetry(request: Request, chain: Interceptor.Chain): Response {
-            preferences.edit().remove(PREF_CRT_TOKEN).apply()
-
-            val currentToken = preferences.getString(PREF_CRT_TOKEN, null)
-            if (currentToken != null) {
-                val newUrl = request.url.newBuilder().addQueryParameter("crt", currentToken).build()
-                return chain.proceed(request.newBuilder().url(newUrl).build())
-            }
-
-            crtTokenLatch = CountDownLatch(1)
-            val handler = Handler(Looper.getMainLooper())
-
-            class JsObject(private val latch: CountDownLatch) {
-                @JavascriptInterface
-                fun onToken(token: String?) {
-                    if (token != null && token.isNotEmpty() && token != "null") {
-                        preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
+            webview.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    view!!.evaluateJavascript("window.localStorage.getItem('clearance')") { clearance ->
+                        webview.stopLoading()
+                        webview.destroy()
+                        _clearance = clearance.takeUnless { it == "null" }?.removeSurrounding("\"")
                         latch.countDown()
                     }
                 }
             }
-
-            handler.post {
-                Toast.makeText(application, "Attempting to get clearance token...", Toast.LENGTH_SHORT).show()
-                webView.addJavascriptInterface(JsObject(crtTokenLatch), "Android")
-                webView.loadUrl(baseUrl)
-            }
-
-            crtTokenLatch.await(45, TimeUnit.SECONDS)
-            handler.post { webView.removeJavascriptInterface("Android") }
-
-            val newCrt = preferences.getString(PREF_CRT_TOKEN, null)
-                ?: throw IOException("Failed to get clearance token. WebView process timed out or failed.")
-
-            val newUrl = request.url.newBuilder().addQueryParameter("crt", newCrt).build()
-            return chain.proceed(request.newBuilder().url(newUrl).build())
+            webview.loadUrl("$baseUrl/")
         }
+        latch.await(10, TimeUnit.SECONDS)
+        return _clearance
     }
-
-    // --- End of New, Toggled Logic ---
-
-    // --- Start of Original User-Provided Logic ---
-
-    private inner class CrtInterceptorOriginal : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val token = preferences.getString(PREF_CF_TOKEN_ORIGINAL, null)
-                ?: return chain.proceed(chain.request())
-
-            val originalRequest = chain.request()
-            if (!originalRequest.url.toString().startsWith(apiUrl)) {
-                return chain.proceed(originalRequest)
-            }
-
-            val newUrl = originalRequest.url.newBuilder()
-                .addQueryParameter("crt", token)
-                .build()
-
-            val newRequest = originalRequest.newBuilder()
-                .url(newUrl)
-                .build()
-
-            return chain.proceed(newRequest)
-        }
-    }
-
-    private inner class CloudflareInterceptorOriginal : Interceptor {
-        private val handler = Handler(Looper.getMainLooper())
-
-        @SuppressLint("ApplySharedPref")
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val request = chain.request()
-            val cookies = webViewCookieJar.loadForRequest(baseUrl.toHttpUrl())
-            cookies.firstOrNull { it.name == "cf_clearance" }?.let { cookie ->
-                val oldToken = preferences.getString(PREF_CF_TOKEN_ORIGINAL, null)
-                if (cookie.value != oldToken) {
-                    preferences.edit().putString(PREF_CF_TOKEN_ORIGINAL, cookie.value).apply()
-                    handler.post {
-                        Toast.makeText(application, "Cloudflare token scraped successfully.", Toast.LENGTH_LONG).show()
-                    }
-                }
-            }
-
-            val response = chain.proceed(request)
-            if (response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true) {
-                response.close()
-                throw IOException("Cloudflare challenge required. Please open in WebView, solve the captcha, and then retry.")
-            }
-            return response
-        }
-    }
-
-    // --- End of Original User-Provided Logic ---
 
     private fun getManga(book: Entry) = SManga.create().apply {
         setUrlWithoutDomain("${book.id}/${book.key}")
@@ -327,9 +188,12 @@ class Koharu(
             else -> "0"
         }
 
-        val imagesResponse = client.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", apiHeaders())).execute()
-        return imagesResponse.parseAs<ImagesInfo>() to realQuality
+        val imagesResponse = clearanceClient.newCall(GET("$apiBooksUrl/data/$entryId/$entryKey/$id/$public_key/$realQuality", lazyHeaders)).execute()
+        val images = imagesResponse.parseAs<ImagesInfo>() to realQuality
+        return images
     }
+
+    // Latest
 
     override fun latestUpdatesRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
@@ -344,10 +208,12 @@ class Koharu(
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
-        apiHeaders(),
+        lazyHeaders,
     )
 
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
+
+    // Popular
 
     override fun popularMangaRequest(page: Int) = GET(
         apiBooksUrl.toHttpUrl().newBuilder().apply {
@@ -363,7 +229,7 @@ class Koharu(
             }
             if (terms.isNotEmpty()) addQueryParameter("s", terms.joinToString(" "))
         }.build(),
-        apiHeaders(),
+        lazyHeaders,
     )
 
     override fun popularMangaParse(response: Response): MangasPage {
@@ -371,15 +237,16 @@ class Koharu(
         return MangasPage(data.entries.map(::getManga), data.page * data.limit < data.total)
     }
 
+    // Search
+
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
         return when {
             query.startsWith(PREFIX_ID_KEY_SEARCH) -> {
                 val ipk = query.removePrefix(PREFIX_ID_KEY_SEARCH)
-                client.newCall(GET("$apiBooksUrl/detail/$ipk", apiHeaders()))
-                    .asObservableSuccess()
-                    .map { response ->
-                        MangasPage(listOf(mangaDetailsParse(response)), false)
-                    }
+                val response = client.newCall(GET("$apiBooksUrl/detail/$ipk", lazyHeaders)).execute()
+                Observable.just(
+                    MangasPage(listOf(mangaDetailsParse(response)), false),
+                )
             }
             else -> super.fetchSearchManga(page, query, filters)
         }
@@ -401,12 +268,14 @@ class Koharu(
             filters.forEach { filter ->
                 when (filter) {
                     is KoharuFilters.SortFilter -> addQueryParameter("sort", filter.getValue())
+
                     is KoharuFilters.CategoryFilter -> {
                         val activeFilter = filter.state.filter { it.state }
                         if (activeFilter.isNotEmpty()) {
                             addQueryParameter("cat", activeFilter.sumOf { it.value }.toString())
                         }
                     }
+
                     is KoharuFilters.TagFilter -> {
                         includedTags += filter.state
                             .filter { it.isIncluded() }
@@ -415,11 +284,13 @@ class Koharu(
                             .filter { it.isExcluded() }
                             .map { it.id }
                     }
+
                     is KoharuFilters.GenreConditionFilter -> {
                         if (filter.state > 0) {
                             addQueryParameter(filter.param, filter.toUriPart())
                         }
                     }
+
                     is KoharuFilters.TextFilter -> {
                         if (filter.state.isNotEmpty()) {
                             val tags = filter.state.split(",").filter(String::isNotBlank).joinToString(",")
@@ -444,13 +315,14 @@ class Koharu(
             addQueryParameter("page", page.toString())
         }.build()
 
-        return GET(url, apiHeaders())
+        return GET(url, lazyHeaders)
     }
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
     override fun getFilterList(): FilterList {
         launchIO { fetchTags() }
+
         return getFilters()
     }
 
@@ -458,26 +330,31 @@ class Koharu(
 
     private fun launchIO(block: () -> Unit) = scope.launch { block() }
 
+    /**
+     * Fetch the genres from the source to be used in the filters.
+     */
     private fun fetchTags() {
         if (tagsFetchAttempts < 3 && !tagsFetched) {
             try {
-                client.newCall(GET("$apiBooksUrl/tags/filters", apiHeaders())).execute().use { response ->
-                    if (!response.isSuccessful) return
-                    response.parseAs<List<Filter>>()
-                        .also { tagsFetched = true }
-                        .takeIf { it.isNotEmpty() }
-                        ?.map { it.toTag() }
-                        ?.also { tags ->
-                            genreList = tags.filterIsInstance<KoharuFilters.Genre>()
-                            femaleList = tags.filterIsInstance<KoharuFilters.Female>()
-                            maleList = tags.filterIsInstance<KoharuFilters.Male>()
-                            artistList = tags.filterIsInstance<KoharuFilters.Artist>()
-                            circleList = tags.filterIsInstance<KoharuFilters.Circle>()
-                            parodyList = tags.filterIsInstance<KoharuFilters.Parody>()
-                            mixedList = tags.filterIsInstance<KoharuFilters.Mixed>()
-                            otherList = tags.filterIsInstance<KoharuFilters.Other>()
-                        }
-                }
+                client.newCall(
+                    GET("$apiBooksUrl/tags/filters", lazyHeaders),
+                ).execute()
+                    .use { it.parseAs<List<Filter>>() }
+                    .also {
+                        tagsFetched = true
+                    }
+                    .takeIf { it.isNotEmpty() }
+                    ?.map { it.toTag() }
+                    ?.also { tags ->
+                        genreList = tags.filterIsInstance<KoharuFilters.Genre>()
+                        femaleList = tags.filterIsInstance<KoharuFilters.Female>()
+                        maleList = tags.filterIsInstance<KoharuFilters.Male>()
+                        artistList = tags.filterIsInstance<KoharuFilters.Artist>()
+                        circleList = tags.filterIsInstance<KoharuFilters.Circle>()
+                        parodyList = tags.filterIsInstance<KoharuFilters.Parody>()
+                        mixedList = tags.filterIsInstance<KoharuFilters.Mixed>()
+                        otherList = tags.filterIsInstance<KoharuFilters.Other>()
+                    }
             } catch (_: Exception) {
             } finally {
                 tagsFetchAttempts++
@@ -485,7 +362,11 @@ class Koharu(
         }
     }
 
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", apiHeaders())
+    // Details
+
+    override fun mangaDetailsRequest(manga: SManga): Request {
+        return GET("$apiBooksUrl/detail/${manga.url}", lazyHeaders)
+    }
 
     override fun mangaDetailsParse(response: Response): SManga {
         val mangaDetail = response.parseAs<MangaDetail>()
@@ -497,7 +378,11 @@ class Koharu(
 
     override fun getMangaUrl(manga: SManga) = "$baseUrl/g/${manga.url}"
 
-    override fun chapterListRequest(manga: SManga): Request = GET("$apiBooksUrl/detail/${manga.url}", apiHeaders())
+    // Chapter
+
+    override fun chapterListRequest(manga: SManga): Request {
+        return GET("$apiBooksUrl/detail/${manga.url}", lazyHeaders)
+    }
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val manga = response.parseAs<MangaDetail>()
@@ -512,60 +397,41 @@ class Koharu(
 
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${chapter.url}"
 
+    // Page List
+
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return client.newCall(pageListRequest(chapter))
+        return clearanceClient.newCall(pageListRequest(chapter))
             .asObservableSuccess()
-            .map(::pageListParse)
+            .map { response ->
+                pageListParse(response)
+            }
     }
 
-    override fun pageListRequest(chapter: SChapter): Request = POST("$apiBooksUrl/detail/${chapter.url}", apiHeaders())
+    override fun pageListRequest(chapter: SChapter): Request {
+        return POST("$apiBooksUrl/detail/${chapter.url}", lazyHeaders)
+    }
 
     override fun pageListParse(response: Response): List<Page> {
         val mangaData = response.parseAs<MangaData>()
         val url = response.request.url.toString()
         val matches = Regex("""/detail/(\d+)/([a-z\d]+)""").find(url)
-            ?: return emptyList()
-        val (entryId, entryKey) = matches.destructured
-        val imagesInfo = getImagesByMangaData(mangaData, entryId, entryKey)
+        if (matches == null || matches.groupValues.size < 3) return emptyList()
+        val imagesInfo = getImagesByMangaData(mangaData, matches.groupValues[1], matches.groupValues[2])
 
         return imagesInfo.first.entries.mapIndexed { index, image ->
             Page(index, imageUrl = "${imagesInfo.first.base}/${image.path}?w=${imagesInfo.second}")
         }
     }
 
-    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, apiHeaders())
+    override fun imageRequest(page: Page): Request {
+        return GET(page.imageUrl!!, lazyHeaders)
+    }
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 
+    // Settings
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_ENABLE_FIXES
-            title = "Enable Experimental Fixes"
-            summary = "Master switch for new experimental features. Disable to revert to original behavior."
-            setDefaultValue(false)
-        }.also(screen::addPreference)
-
-        SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_AUTO_CRT_FETCH
-            title = "Enable Automatic CRT Token Fetching"
-            summary = "When enabled, will try to get the site's clearance token automatically in the background. Requires 'Enable Experimental Fixes' to be on."
-            setDefaultValue(false)
-        }.also(screen::addPreference)
-
-        SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_USER_AGENT_SWITCH
-            title = "Use Static User-Agent"
-            summary = "Force a consistent User-Agent for the app and WebView to prevent mismatches."
-            setDefaultValue(false)
-        }.also(screen::addPreference)
-
-        SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_COOKIE_FLUSH
-            title = "Force Cookie Flushing"
-            summary = "Forces cookies from WebView to save immediately. May help with Cloudflare loops."
-            setDefaultValue(false)
-        }.also(screen::addPreference)
-
         ListPreference(screen.context).apply {
             key = PREF_IMAGERES
             title = "Image Resolution"
@@ -591,47 +457,16 @@ class Koharu(
         }.also(screen::addPreference)
     }
 
-    private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
+    private inline fun <reified T> Response.parseAs(): T {
+        return json.decodeFromString(body.string())
+    }
 
     companion object {
         const val PREFIX_ID_KEY_SEARCH = "id:"
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
-        private const val PREF_CF_TOKEN_ORIGINAL = "pref_cloudflare_token" // Original key
-        private const val PREF_CRT_TOKEN = "pref_clearance_token" // New key for the correct token
-
-        // Toggles for debugging
-        private const val PREF_ENABLE_FIXES = "pref_enable_fixes"
-        private const val PREF_AUTO_CRT_FETCH = "pref_auto_crt_fetch"
-        private const val PREF_USER_AGENT_SWITCH = "pref_user_agent_switch"
-        private const val PREF_COOKIE_FLUSH = "pref_cookie_flush"
 
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
-    }
-}
-
-class WebViewCookieJar(private val forceFlush: Boolean = false) : okhttp3.CookieJar {
-    private val cookieManager = CookieManager.getInstance()
-
-    override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<Cookie>) {
-        val urlString = url.toString()
-        cookies.forEach { cookie ->
-            cookieManager.setCookie(urlString, cookie.toString())
-        }
-        if (forceFlush) {
-            cookieManager.flush()
-        }
-    }
-
-    override fun loadForRequest(url: okhttp3.HttpUrl): List<Cookie> {
-        val cookiesString = cookieManager.getCookie(url.toString())
-        return if (cookiesString != null && cookiesString.isNotEmpty()) {
-            cookiesString.split(";").mapNotNull { cookieString ->
-                Cookie.parse(url, cookieString.trim())
-            }
-        } else {
-            emptyList()
-        }
     }
 }
