@@ -83,54 +83,29 @@ class Koharu(
     private fun quality() = preferences.getString(PREF_IMAGERES, "1280")!!
     private fun remadd() = preferences.getBoolean(PREF_REM_ADD, false)
     private fun alwaysExcludeTags() = preferences.getString(PREF_EXCLUDE_TAGS, "")
+    private fun autoCrt() = preferences.getBoolean(PREF_AUTO_CRT, false)
+
+    private var _domainUrl: String? = null
+    private val domainUrl: String
+        get() = _domainUrl ?: run {
+            val domain = try {
+                val host = network.client.newCall(GET(baseUrl, headers)).execute().request.url.host
+                "https://$host"
+            } catch (_: Exception) {
+                baseUrl
+            }
+            _domainUrl = domain
+            domain
+        }
 
     private fun apiHeaders(): Headers {
         return headersBuilder()
-            .set("Referer", "$baseUrl/")
-            .set("Origin", baseUrl)
+            .set("Referer", "$domainUrl/")
+            .set("Origin", domainUrl)
             .build()
     }
 
     private val webViewCookieJar = WebViewCookieJar()
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun createWebView(): WebView {
-        return WebView(application).apply {
-            settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                databaseEnabled = true
-                userAgentString = this@Koharu.userAgent // Ensure consistency
-            }
-            webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView, url: String) {
-                    super.onPageFinished(view, url)
-                    if (url == "$baseUrl/") {
-                        view.evaluateJavascript(
-                            """
-                            (function() {
-                                const originalSetItem = localStorage.setItem;
-                                localStorage.setItem = function(key, value) {
-                                    if (key === 'clearance' && window.Android && typeof window.Android.onToken === 'function') {
-                                        window.Android.onToken(value);
-                                    }
-                                    originalSetItem.apply(this, arguments);
-                                };
-                                const token = localStorage.getItem('clearance');
-                                if (token) {
-                                    window.Android.onToken(token);
-                                }
-                            })();
-                            """.trimIndent(),
-                        ) { /* Do nothing */ }
-                    }
-                }
-            }
-        }
-    }
-    private val webView by lazy { createWebView() }
-
-    private var crtTokenLatch = CountDownLatch(0)
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
@@ -144,9 +119,8 @@ class Koharu(
         override fun intercept(chain: Interceptor.Chain): Response {
             val originalRequest = chain.request()
 
-            // Step 1: Add CRT token if available and it's an API request
             val crt = preferences.getString(PREF_CRT_TOKEN, null)
-            val request = if (crt != null && originalRequest.url.toString().startsWith(apiUrl)) {
+            val requestWithCrt = if (crt != null && originalRequest.url.toString().startsWith(apiUrl)) {
                 val newUrl = originalRequest.url.newBuilder()
                     .addQueryParameter("crt", crt)
                     .build()
@@ -155,72 +129,90 @@ class Koharu(
                 originalRequest
             }
 
-            // Step 2: Proceed with the request
-            val response = chain.proceed(request)
+            val response = chain.proceed(requestWithCrt)
 
-            // Step 3: Analyze the response for security challenges
             when {
-                // Case A: Cloudflare browser check failed (needs cf_clearance cookie)
                 response.code in listOf(503, 403) && response.header("Server")?.startsWith("cloudflare") == true -> {
                     response.close()
-                    // This is Gate 1. Force user to solve the initial challenge.
                     throw IOException("Cloudflare challenge required. Please open in WebView, solve the puzzle, and then retry.")
                 }
-                // Case B: API rejected the request (likely missing or invalid CRT token)
-                response.code in listOf(401, 403) && request.url.toString().startsWith(apiUrl) -> {
+                response.code in listOf(401, 403) && requestWithCrt.url.toString().startsWith(apiUrl) -> {
                     response.close()
-                    // This is Gate 2. We passed Cloudflare but need a new CRT.
-                    return handleCrtRefreshAndRetry(originalRequest, chain)
+                    if (autoCrt()) {
+                        val newCrt = fetchCrtTokenViaWebView()
+                        val newRequest = originalRequest.newBuilder()
+                            .url(originalRequest.url.newBuilder().addQueryParameter("crt", newCrt).build())
+                            .build()
+                        return chain.proceed(newRequest)
+                    } else {
+                        throw IOException("Clearance token is invalid or expired. Please open in WebView, wait for the page to load, and then retry.")
+                    }
                 }
             }
 
             return response
         }
 
-        @SuppressLint("AddJavascriptInterface")
+        @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
         @Synchronized
-        private fun handleCrtRefreshAndRetry(request: Request, chain: Interceptor.Chain): Response {
-            // Invalidate old token
+        private fun fetchCrtTokenViaWebView(): String {
             preferences.edit().remove(PREF_CRT_TOKEN).apply()
 
-            // Check if another thread already got the token while we were waiting
-            val currentToken = preferences.getString(PREF_CRT_TOKEN, null)
-            if (currentToken != null) {
-                val newUrl = request.url.newBuilder()
-                    .addQueryParameter("crt", currentToken)
-                    .build()
-                return chain.proceed(request.newBuilder().url(newUrl).build())
-            }
+            val latch = CountDownLatch(1)
+            var token: String? = null
 
-            crtTokenLatch = CountDownLatch(1)
-            val handler = Handler(Looper.getMainLooper())
-
-            class JsObject(private val latch: CountDownLatch) {
+            class JsObject {
                 @JavascriptInterface
-                fun onToken(token: String?) {
-                    if (token != null && token.isNotEmpty() && token != "null") {
+                fun onToken(receivedToken: String?) {
+                    if (receivedToken != null && receivedToken.isNotEmpty() && receivedToken != "null") {
+                        token = receivedToken
                         preferences.edit().putString(PREF_CRT_TOKEN, token).apply()
                         latch.countDown()
                     }
                 }
             }
 
+            val handler = Handler(Looper.getMainLooper())
             handler.post {
-                Toast.makeText(application, "Attempting to get clearance token...", Toast.LENGTH_SHORT).show()
-                webView.addJavascriptInterface(JsObject(crtTokenLatch), "Android")
-                webView.loadUrl(baseUrl)
+                val webView = WebView(application)
+                webView.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    userAgentString = this@Koharu.userAgent
+                }
+                webView.addJavascriptInterface(JsObject(), "Android")
+                webView.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String) {
+                        super.onPageFinished(view, url)
+                        if (url == "$domainUrl/") {
+                            view.evaluateJavascript(
+                                """
+                                (function() {
+                                    const originalSetItem = localStorage.setItem;
+                                    localStorage.setItem = function(key, value) {
+                                        if (key === 'clearance' && window.Android && typeof window.Android.onToken === 'function') {
+                                            window.Android.onToken(value);
+                                        }
+                                        originalSetItem.apply(this, arguments);
+                                    };
+                                    const token = localStorage.getItem('clearance');
+                                    if (token) {
+                                        window.Android.onToken(token);
+                                    }
+                                })();
+                                """.trimIndent(),
+                            ) {}
+                        }
+                    }
+                }
+                Toast.makeText(application, "Attempting to get clearance token automatically...", Toast.LENGTH_SHORT).show()
+                webView.loadUrl(domainUrl)
             }
 
-            crtTokenLatch.await(45, TimeUnit.SECONDS)
-            handler.post { webView.removeJavascriptInterface("Android") }
+            latch.await(45, TimeUnit.SECONDS)
 
-            val newCrt = preferences.getString(PREF_CRT_TOKEN, null)
-                ?: throw IOException("Failed to get clearance token. WebView process timed out or failed.")
-
-            val newUrl = request.url.newBuilder()
-                .addQueryParameter("crt", newCrt)
-                .build()
-            return chain.proceed(request.newBuilder().url(newUrl).build())
+            return token ?: throw IOException("Failed to get clearance token automatically. Try solving manually in WebView.")
         }
     }
 
@@ -498,6 +490,13 @@ class Koharu(
             summary = "Separate tags with commas (,).\n" +
                 "Excluding: ${alwaysExcludeTags()}"
         }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_AUTO_CRT
+            title = "Automated clearance"
+            summary = "When enabled, the extension will try to get the clearance token automatically in the background. If disabled, you will have to manually use WebView when the token expires."
+            setDefaultValue(false)
+        }.also(screen::addPreference)
     }
 
     private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
@@ -507,6 +506,7 @@ class Koharu(
         private const val PREF_IMAGERES = "pref_image_quality"
         private const val PREF_REM_ADD = "pref_remove_additional"
         private const val PREF_EXCLUDE_TAGS = "pref_exclude_tags"
+        private const val PREF_AUTO_CRT = "pref_auto_crt"
         private const val PREF_CRT_TOKEN = "pref_clearance_token"
         internal val dateReformat = SimpleDateFormat("EEEE, d MMM yyyy HH:mm (z)", Locale.ENGLISH)
     }
