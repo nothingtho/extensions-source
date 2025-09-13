@@ -23,5 +23,14 @@
                 <data android:host="hoshino.one" />
             </intent-filter>
         </activity>
+
+        <!-- ADDED THIS NEW ACTIVITY DECLARATION -->
+        <activity
+            android:name=".all.koharu.KoharuWebViewActivity"
+            android:configChanges="orientation|screenSize"
+            android:exported="false"
+            android:theme="@style/Theme.AppCompat.Light.NoActionBar"
+            android:label="Cloudflare Challenge" />
+
     </application>
 </manifest>
